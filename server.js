@@ -53,35 +53,16 @@ const VARIANT_WITH_LEVELS = `
   }
 `;
 
-const PRODUCTS_WITH_LEVELS = `
-  query ProductsWithLevels($cursor: String) {
-    products(first: 50, after: $cursor) {
+// Query ligera: productos -> IDs de variantes (sin niveles)
+const PRODUCTS_VARIANT_IDS = `
+  query ProductsVariantIds($cursor: String) {
+    products(first: 20, after: $cursor) {
       pageInfo { hasNextPage endCursor }
       edges {
         node {
           title
           variants(first: 100) {
-            edges {
-              node {
-                id
-                sku
-                inventoryItem {
-                  id
-                  tracked
-                  inventoryLevels(first: 100) {
-                    edges {
-                      node {
-                        location { id name }
-                        quantities(names: ["on_hand","available","committed","incoming"]) {
-                          name
-                          quantity
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
+            edges { node { id sku } }
           }
         }
       }
@@ -113,12 +94,53 @@ function shouldFix(map) {
   const incoming = map.incoming ?? 0;
   return onHand < 0 || (available < 0 && committed === 0 && incoming === 0);
 }
+
+// Trae niveles de UNA variante (usa VARIANT_WITH_LEVELS)
+async function fetchVariantLevels(variantIdGid) {
+  const data = await shopifyGraphQL(VARIANT_WITH_LEVELS, { id: variantIdGid });
+  return data.productVariant || null;
+}
+
+// Escaneo global evitando coste excesivo: productos -> IDs variantes -> niveles por variante
 async function scanAllNegatives({ excludeLocationContains } = {}) {
   let cursor = null, hasNext = true;
   const corrections = [];
 
+  const CONCURRENCY = 5; // nº de variantes en paralelo como máximo
+  const queue = [];
+
+  async function processVariant(vNode, productTitle) {
+    const v = await fetchVariantLevels(vNode.id);
+    if (!v?.inventoryItem?.tracked) return;
+
+    for (const { node: lvl } of v.inventoryItem.inventoryLevels.edges) {
+      if (excludeLocationContains && lvl.location.name?.includes(excludeLocationContains)) continue;
+
+      const m = mapQuantities(lvl.quantities);
+      if (shouldFix(m)) {
+        corrections.push({
+          inventoryItemId: v.inventoryItem.id,
+          locationId: lvl.location.id,
+          setOnHandTo: 0,
+          meta: {
+            variantId: v.id,
+            sku: v.sku || vNode.sku || 'NO-SKU',
+            productTitle,
+            locationName: lvl.location.name,
+            before: {
+              onHand: m.on_hand ?? 0,
+              available: m.available ?? 0,
+              committed: m.committed ?? 0,
+              incoming: m.incoming ?? 0
+            }
+          }
+        });
+      }
+    }
+  }
+
   while (hasNext) {
-    const data = await shopifyGraphQL(PRODUCTS_WITH_LEVELS, { cursor });
+    const data = await shopifyGraphQL(PRODUCTS_VARIANT_IDS, { cursor });
     const { edges, pageInfo } = data.products;
     hasNext = pageInfo.hasNextPage;
     cursor = pageInfo.endCursor;
@@ -126,39 +148,26 @@ async function scanAllNegatives({ excludeLocationContains } = {}) {
     for (const pe of edges) {
       const productTitle = pe.node.title;
       for (const ve of pe.node.variants.edges) {
-        const v = ve.node;
-        const invItem = v.inventoryItem;
-        if (!invItem?.tracked) continue;
-
-        for (const { node: lvl } of invItem.inventoryLevels.edges) {
-          if (excludeLocationContains && lvl.location.name?.includes(excludeLocationContains)) continue;
-
-          const m = mapQuantities(lvl.quantities);
-          if (shouldFix(m)) {
-            corrections.push({
-              inventoryItemId: invItem.id,
-              locationId: lvl.location.id,
-              setOnHandTo: 0,
-              meta: {
-                variantId: v.id,
-                sku: v.sku || 'NO-SKU',
-                productTitle,
-                locationName: lvl.location.name,
-                before: {
-                  onHand: m.on_hand ?? 0,
-                  available: m.available ?? 0,
-                  committed: m.committed ?? 0,
-                  incoming: m.incoming ?? 0
-                }
-              }
-            });
+        const p = processVariant(ve.node, productTitle).catch(() => {});
+        queue.push(p);
+        if (queue.length >= CONCURRENCY) {
+          await Promise.race(queue);
+          // limpia resueltas
+          for (let i = queue.length - 1; i >= 0; i--) {
+            if (queue[i].settled) queue.splice(i, 1);
           }
         }
+        // marca settled para limpieza simple
+        p.finally(() => { p.settled = true; });
       }
     }
   }
+
+  // espera a que acaben todas
+  await Promise.allSettled(queue);
   return corrections;
 }
+
 async function applyBatches(corrections, reason = 'correction') {
   const BATCH = 200; // bajo el límite (250)
   const results = [];
@@ -175,6 +184,9 @@ async function applyBatches(corrections, reason = 'correction') {
     };
     const resp = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
     results.push(resp.inventorySetOnHandQuantities);
+
+    // pequeño respiro para ir suaves con el API
+    await new Promise(r => setTimeout(r, 200));
   }
   return results;
 }
@@ -280,7 +292,7 @@ app.get('/auto-dry', async (req, res) => {
       ok: true,
       mode: 'dry-run',
       toFixCount: corrections.length,
-      sample: corrections.slice(0, 50), // muestra
+      sample: corrections.slice(0, 50) // muestra
     });
   } catch (e) {
     console.error(e);
