@@ -188,7 +188,7 @@ async function applyBatches(corrections, reason = 'correction') {
       // referenceDocumentUri opcional si quieres dejar rastro externo
     };
     const resp = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
-    results.push(resp.inventorySetOnHandQuantities);
+    results.push(resp.inventorySetOnHandQuantities); 
 
     // pequeño respiro para ir suaves con el API
     await new Promise(r => setTimeout(r, 200));
