@@ -1,6 +1,9 @@
 // server.js
 import express from 'express';
 import fetch from 'node-fetch';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -8,6 +11,10 @@ const PORT = process.env.PORT || 8080;
 const SHOP = process.env.SHOPIFY_SHOP;               // p.ej. silbon-store.myshopify.com
 const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;       // shpat_****
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const BULK_FILE = path.join('/tmp', 'shopify-bulk.ndjson'); // Render: /tmp es válido
 
 function toGidVariant(idOrGid) {
   const s = String(idOrGid || '');
@@ -82,6 +89,61 @@ const INVENTORY_SET_ON_HAND = `
     }
   }
 `;
+
+// ===== BULK OPS =====
+const BULK_RUN = `
+  mutation bulkOp($query: String!) {
+    bulkOperationRunQuery(query: $query) {
+      bulkOperation { id status }
+      userErrors { field message }
+    }
+  }
+`;
+
+const BULK_STATUS = `
+  query {
+    currentBulkOperation {
+      id
+      status
+      errorCode
+      createdAt
+      completedAt
+      objectCount
+      fileSize
+      url
+    }
+  }
+`;
+
+// Query bulk: todas las variantes con niveles por localización (formato NDJSON)
+function buildBulkQuery() {
+  return `
+  {
+    productVariants {
+      edges {
+        node {
+          id
+          sku
+          product { title }
+          inventoryItem {
+            id
+            inventoryLevels {
+              edges {
+                node {
+                  location { id name }
+                  quantities(names: ["on_hand","available","committed","incoming"]) {
+                    name
+                    quantity
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }`;
+}
 
 // ===== HELPERS =====
 function mapQuantities(qs) {
@@ -199,6 +261,55 @@ async function applyBatches(corrections, reason = 'correction') {
     await new Promise(r => setTimeout(r, 200));
   }
   return results;
+}
+
+// ===== NDJSON utils (Bulk) =====
+function* parseNdjsonLines(str) {
+  const lines = str.split(/\r?\n/);
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try { yield JSON.parse(line); } catch { /* ignorar líneas corruptas */ }
+  }
+}
+
+function collectCorrectionsFromBulkNode(node, { exclude, raise }) {
+  const out = [];
+  const v = node; // productVariant node
+  const invItem = v?.inventoryItem;
+  if (!invItem) return out;
+
+  const levels = invItem.inventoryLevels?.edges || [];
+  for (const e of levels) {
+    const lvl = e.node;
+    if (!lvl) continue;
+    if (exclude && lvl.location?.name?.includes(exclude)) continue;
+
+    const qs = lvl.quantities || [];
+    const m = Object.fromEntries(qs.map(q => [q.name, q.quantity]));
+    const onHand = m.on_hand ?? 0;
+    const available = m.available ?? 0;
+    const committed = m.committed ?? 0;
+    const incoming = m.incoming ?? 0;
+
+    const fixable = onHand < 0 || (available < 0 && (committed === 0 || (raise && committed > 0)) && incoming === 0);
+    if (!fixable) continue;
+
+    const target = (raise && committed > 0) ? committed : 0;
+
+    out.push({
+      inventoryItemId: invItem.id,
+      locationId: lvl.location?.id,
+      setOnHandTo: target,
+      meta: {
+        variantId: v.id,
+        sku: v.sku || 'NO-SKU',
+        productTitle: v.product?.title || '',
+        locationName: lvl.location?.name || '',
+        before: { onHand, available, committed, incoming }
+      }
+    });
+  }
+  return out;
 }
 
 // ===== ROUTES =====
@@ -334,6 +445,115 @@ app.get('/auto-fix', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ===== BULK ROUTES =====
+
+// start: lanza la operación bulk
+app.post('/bulk-start', async (req, res) => {
+  try {
+    const query = buildBulkQuery();
+    const data = await shopifyGraphQL(BULK_RUN, { query });
+    const errs = data.bulkOperationRunQuery.userErrors || [];
+    if (errs.length) return res.status(400).json({ ok: false, userErrors: errs });
+
+    const op = data.bulkOperationRunQuery.bulkOperation;
+    res.json({ ok: true, started: op });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error: e.message });
+  }
+});
+
+// status: progreso y url de archivo cuando termine
+app.get('/bulk-status', async (_req, res) => {
+  try {
+    const data = await shopifyGraphQL(BULK_STATUS);
+    res.json({ ok: true, status: data.currentBulkOperation });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error: e.message });
+  }
+});
+
+// download: baja el NDJSON a /tmp
+app.get('/bulk-download', async (_req, res) => {
+  try {
+    const st = await shopifyGraphQL(BULK_STATUS);
+    const op = st.currentBulkOperation;
+    if (!op || op.status !== 'COMPLETED' || !op.url) {
+      return res.status(400).json({ ok:false, error:'Bulk no está COMPLETED o no hay url', status: op || null });
+    }
+
+    const r = await fetch(op.url); // url pública temporal de Shopify
+    if (!r.ok) throw new Error(`descarga bulk falló: ${r.status}`);
+    const text = await r.text();
+
+    fs.writeFileSync(BULK_FILE, text, 'utf8');
+    res.json({ ok:true, savedTo: BULK_FILE, bytes: Buffer.byteLength(text, 'utf8'), objectCount: op.objectCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error: e.message });
+  }
+});
+
+// bulk-dry: lee NDJSON y muestra qué tocaríamos (sin tocar nada)
+app.get('/bulk-dry', async (req, res) => {
+  try {
+    if (!fs.existsSync(BULK_FILE)) return res.status(400).json({ ok:false, error:'No se encuentra el archivo bulk. Ejecuta /bulk-download primero.' });
+
+    const text = fs.readFileSync(BULK_FILE, 'utf8');
+    const exclude = req.query.exclude || null;
+    const raise = req.query.raise === '1';
+    const onlyVariantId = req.query.onlyVariantId || null;
+
+    const corrections = [];
+    for (const obj of parseNdjsonLines(text)) {
+      const node = obj?.id && obj?.inventoryItem ? obj : obj?.node || obj;
+      if (!node?.id) continue;
+      if (onlyVariantId && node.id !== onlyVariantId) continue;
+
+      corrections.push(...collectCorrectionsFromBulkNode(node, { exclude, raise }));
+    }
+
+    res.json({ ok:true, mode:'dry-run (bulk file)', toFixCount: corrections.length, sample: corrections.slice(0, 50) });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error: e.message });
+  }
+});
+
+// bulk-fix: aplica fixes leyendo el NDJSON (con filtros)
+app.get('/bulk-fix', async (req, res) => {
+  try {
+    if (!fs.existsSync(BULK_FILE)) return res.status(400).json({ ok:false, error:'No se encuentra el archivo bulk. Ejecuta /bulk-download primero.' });
+
+    const text = fs.readFileSync(BULK_FILE, 'utf8');
+    const exclude = req.query.exclude || null;
+    const raise = req.query.raise === '1';
+    const onlyVariantId = req.query.onlyVariantId || null;
+    const excludeVariantId = req.query.excludeVariantId || null;
+
+    const corrections = [];
+    for (const obj of parseNdjsonLines(text)) {
+      const node = obj?.id && obj?.inventoryItem ? obj : obj?.node || obj;
+      if (!node?.id) continue;
+      if (onlyVariantId && node.id !== onlyVariantId) continue;
+      if (excludeVariantId && node.id === excludeVariantId) continue;
+
+      corrections.push(...collectCorrectionsFromBulkNode(node, { exclude, raise }));
+    }
+
+    if (corrections.length === 0) {
+      return res.json({ ok:true, fixedCount: 0, message: 'Nada que corregir con los filtros dados.' });
+    }
+
+    const results = await applyBatches(corrections, 'correction');
+    res.json({ ok:true, fixedCount: corrections.length, batches: results.length });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error: e.message });
   }
 });
 
