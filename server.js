@@ -102,7 +102,7 @@ async function fetchVariantLevels(variantIdGid) {
 }
 
 // Escaneo global evitando coste excesivo: productos -> IDs variantes -> niveles por variante
-async function scanAllNegatives({ excludeLocationContains, maxPages = null, concurrency = 5 } = {}) {
+async function scanAllNegatives({ excludeLocationContains, maxPages = null, concurrency = 5, raise = false } = {}) {
   let cursor = null, hasNext = true;
   const corrections = [];
 
@@ -119,10 +119,11 @@ async function scanAllNegatives({ excludeLocationContains, maxPages = null, conc
 
       const m = mapQuantities(lvl.quantities);
       if (shouldFix(m)) {
+        const target = (raise && (m.committed ?? 0) > 0) ? (m.committed ?? 0) : 0;
         corrections.push({
           inventoryItemId: v.inventoryItem.id,
           locationId: lvl.location.id,
-          setOnHandTo: 0,
+          setOnHandTo: target,
           meta: {
             variantId: v.id,
             sku: v.sku || vNode.sku || 'NO-SKU',
@@ -182,7 +183,7 @@ async function applyBatches(corrections, reason = 'correction') {
       setQuantities: batch.map(c => ({
         inventoryItemId: c.inventoryItemId,
         locationId: c.locationId,
-        quantity: 0
+        quantity: (typeof c.setOnHandTo === 'number') ? c.setOnHandTo : 0
       }))
       // referenceDocumentUri opcional si quieres dejar rastro externo
     };
@@ -245,7 +246,7 @@ app.get('/variant-dry', async (req, res) => {
 // ---- Variante: fix ----
 app.get('/variant-fix', async (req, res) => {
   try {
-    const { variantId, variantGid } = req.query;
+    const { variantId, variantGid, raise } = req.query;
     const gid = toGidVariant(variantGid || variantId);
     if (!variantId && !variantGid) {
       return res.status(400).json({ ok: false, error: 'Falta ?variantId= o ?variantGid=' });
@@ -261,12 +262,13 @@ app.get('/variant-fix', async (req, res) => {
     for (const { node: lvl } of v.inventoryItem.inventoryLevels.edges) {
       const m = mapQuantities(lvl.quantities);
       if (shouldFix(m)) {
-        setQuantities.push({ inventoryItemId: v.inventoryItem.id, locationId: lvl.location.id, quantity: 0 });
+        const target = (raise === '1' && (m.committed ?? 0) > 0) ? (m.committed ?? 0) : 0;
+        setQuantities.push({ inventoryItemId: v.inventoryItem.id, locationId: lvl.location.id, quantity: target });
         report.push({
           locationId: lvl.location.id,
           locationName: lvl.location.name,
           before: { onHand: m.on_hand ?? 0, available: m.available ?? 0, committed: m.committed ?? 0, incoming: m.incoming ?? 0 },
-          setOnHandTo: 0
+          setOnHandTo: target
         });
       }
     }
@@ -291,9 +293,10 @@ app.get('/variant-fix', async (req, res) => {
 app.get('/auto-dry', async (req, res) => {
   try {
     const exclude = req.query.exclude || null;
-    const pages = req.query.pages ? Number(req.query.pages) : null; // ej: ?pages=1
-    const c = req.query.c ? Number(req.query.c) : 5;                // ej: ?c=5
-    const corrections = await scanAllNegatives({ excludeLocationContains: exclude, maxPages: pages, concurrency: c });
+    const pages = req.query.pages ? Number(req.query.pages) : null;
+    const c = req.query.c ? Number(req.query.c) : 5;
+    const raise = req.query.raise === '1';
+    const corrections = await scanAllNegatives({ excludeLocationContains: exclude, maxPages: pages, concurrency: c, raise });
     res.json({
       ok: true,
       mode: 'dry-run',
@@ -312,7 +315,8 @@ app.get('/auto-fix', async (req, res) => {
     const exclude = req.query.exclude || null;
     const pages = req.query.pages ? Number(req.query.pages) : null;
     const c = req.query.c ? Number(req.query.c) : 5;
-    const corrections = await scanAllNegatives({ excludeLocationContains: exclude, maxPages: pages, concurrency: c });
+    const raise = req.query.raise === '1';
+    const corrections = await scanAllNegatives({ excludeLocationContains: exclude, maxPages: pages, concurrency: c, raise });
     if (corrections.length === 0) return res.json({ ok: true, fixedCount: 0, message: 'No hay negativos que corregir 👌' });
 
     const results = await applyBatches(corrections, 'correction');
