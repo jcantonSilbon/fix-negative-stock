@@ -53,6 +53,14 @@ const VARIANT_WITH_LEVELS = `
 `;
 
 app.get('/health', (_, res) => res.send('OK'));
+app.get('/env-check', (_, res) => {
+  res.json({
+    SHOPIFY_SHOP: process.env.SHOPIFY_SHOP || null,
+    SHOPIFY_API_VERSION: process.env.SHOPIFY_API_VERSION || null,
+    HAS_TOKEN: !!process.env.SHOPIFY_ADMIN_TOKEN // true/false, no mostramos el token
+  });
+});
+
 
 app.get('/variant-dry', async (req, res) => {
   try {
