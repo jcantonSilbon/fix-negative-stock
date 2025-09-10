@@ -27,6 +27,7 @@ async function shopifyGraphQL(query, variables = {}) {
   return json.data;
 }
 
+// ===== QUERIES / MUTATIONS =====
 const VARIANT_WITH_LEVELS = `
   query VariantWithLevels($id: ID!) {
     productVariant(id: $id) {
@@ -52,6 +53,42 @@ const VARIANT_WITH_LEVELS = `
   }
 `;
 
+const PRODUCTS_WITH_LEVELS = `
+  query ProductsWithLevels($cursor: String) {
+    products(first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        node {
+          title
+          variants(first: 100) {
+            edges {
+              node {
+                id
+                sku
+                inventoryItem {
+                  id
+                  tracked
+                  inventoryLevels(first: 100) {
+                    edges {
+                      node {
+                        location { id name }
+                        quantities(names: ["on_hand","available","committed","incoming"]) {
+                          name
+                          quantity
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
 const INVENTORY_SET_ON_HAND = `
   mutation SetOnHand($input: InventorySetOnHandQuantitiesInput!) {
     inventorySetOnHandQuantities(input: $input) {
@@ -65,15 +102,94 @@ const INVENTORY_SET_ON_HAND = `
   }
 `;
 
+// ===== HELPERS =====
+function mapQuantities(qs) {
+  return Object.fromEntries(qs.map(q => [q.name, q.quantity]));
+}
+function shouldFix(map) {
+  const onHand = map.on_hand ?? 0;
+  const available = map.available ?? 0;
+  const committed = map.committed ?? 0;
+  const incoming = map.incoming ?? 0;
+  return onHand < 0 || (available < 0 && committed === 0 && incoming === 0);
+}
+async function scanAllNegatives({ excludeLocationContains } = {}) {
+  let cursor = null, hasNext = true;
+  const corrections = [];
+
+  while (hasNext) {
+    const data = await shopifyGraphQL(PRODUCTS_WITH_LEVELS, { cursor });
+    const { edges, pageInfo } = data.products;
+    hasNext = pageInfo.hasNextPage;
+    cursor = pageInfo.endCursor;
+
+    for (const pe of edges) {
+      const productTitle = pe.node.title;
+      for (const ve of pe.node.variants.edges) {
+        const v = ve.node;
+        const invItem = v.inventoryItem;
+        if (!invItem?.tracked) continue;
+
+        for (const { node: lvl } of invItem.inventoryLevels.edges) {
+          if (excludeLocationContains && lvl.location.name?.includes(excludeLocationContains)) continue;
+
+          const m = mapQuantities(lvl.quantities);
+          if (shouldFix(m)) {
+            corrections.push({
+              inventoryItemId: invItem.id,
+              locationId: lvl.location.id,
+              setOnHandTo: 0,
+              meta: {
+                variantId: v.id,
+                sku: v.sku || 'NO-SKU',
+                productTitle,
+                locationName: lvl.location.name,
+                before: {
+                  onHand: m.on_hand ?? 0,
+                  available: m.available ?? 0,
+                  committed: m.committed ?? 0,
+                  incoming: m.incoming ?? 0
+                }
+              }
+            });
+          }
+        }
+      }
+    }
+  }
+  return corrections;
+}
+async function applyBatches(corrections, reason = 'correction') {
+  const BATCH = 200; // bajo el límite (250)
+  const results = [];
+  for (let i = 0; i < corrections.length; i += BATCH) {
+    const batch = corrections.slice(i, i + BATCH);
+    const input = {
+      reason,
+      setQuantities: batch.map(c => ({
+        inventoryItemId: c.inventoryItemId,
+        locationId: c.locationId,
+        quantity: 0
+      }))
+      // referenceDocumentUri opcional si quieres dejar rastro externo
+    };
+    const resp = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
+    results.push(resp.inventorySetOnHandQuantities);
+  }
+  return results;
+}
+
+// ===== ROUTES =====
 app.get('/health', (_, res) => res.send('OK'));
 app.get('/env-check', (_, res) => {
   res.json({
     SHOPIFY_SHOP: process.env.SHOPIFY_SHOP || null,
     SHOPIFY_API_VERSION: process.env.SHOPIFY_API_VERSION || null,
-    HAS_TOKEN: !!process.env.SHOPIFY_ADMIN_TOKEN // true/false, no mostramos el token
+    HAS_TOKEN: !!process.env.SHOPIFY_ADMIN_TOKEN
   });
 });
 
+// ---- Variante: dry ----
 app.get('/variant-dry', async (req, res) => {
   try {
     const { variantId, variantGid } = req.query;
@@ -87,18 +203,11 @@ app.get('/variant-dry', async (req, res) => {
     if (!v) return res.status(404).json({ ok: false, error: 'Variante no encontrada' });
     if (!v.inventoryItem?.tracked) return res.json({ ok: true, toFixCount: 0, note: 'inventoryItem no tracked' });
 
-    // calcular posibles correcciones (solo reporte)
-    const corrections = [];
+    const items = [];
     for (const { node: lvl } of v.inventoryItem.inventoryLevels.edges) {
-      const map = Object.fromEntries(lvl.quantities.map(q => [q.name, q.quantity]));
-      const onHand = map.on_hand ?? 0;
-      const available = map.available ?? 0;
-      const committed = map.committed ?? 0;
-      const incoming = map.incoming ?? 0;
-
-      const shouldFix = onHand < 0 || (available < 0 && committed === 0 && incoming === 0);
-      if (shouldFix) {
-        corrections.push({
+      const m = mapQuantities(lvl.quantities);
+      if (shouldFix(m)) {
+        items.push({
           inventoryItemId: v.inventoryItem.id,
           variantId: v.id,
           sku: v.sku || 'NO-SKU',
@@ -106,19 +215,18 @@ app.get('/variant-dry', async (req, res) => {
           locationId: lvl.location.id,
           locationName: lvl.location.name,
           setOnHandTo: 0,
-          before: { onHand, available, committed, incoming }
+          before: { onHand: m.on_hand ?? 0, available: m.available ?? 0, committed: m.committed ?? 0, incoming: m.incoming ?? 0 }
         });
       }
     }
-
-    res.json({ ok: true, mode: 'dry-run', toFixCount: corrections.length, items: corrections });
+    res.json({ ok: true, mode: 'dry-run', toFixCount: items.length, items });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// nuevo endpoint para arreglar la variante
+// ---- Variante: fix ----
 app.get('/variant-fix', async (req, res) => {
   try {
     const { variantId, variantGid } = req.query;
@@ -135,42 +243,64 @@ app.get('/variant-fix', async (req, res) => {
     const setQuantities = [];
     const report = [];
     for (const { node: lvl } of v.inventoryItem.inventoryLevels.edges) {
-      const map = Object.fromEntries(lvl.quantities.map(q => [q.name, q.quantity]));
-      const onHand = map.on_hand ?? 0;
-      const available = map.available ?? 0;
-      const committed = map.committed ?? 0;
-      const incoming = map.incoming ?? 0;
-
-      const shouldFix = onHand < 0 || (available < 0 && committed === 0 && incoming === 0);
-      if (shouldFix) {
-        setQuantities.push({
-          inventoryItemId: v.inventoryItem.id,
-          locationId: lvl.location.id,
-          quantity: 0
-        });
+      const m = mapQuantities(lvl.quantities);
+      if (shouldFix(m)) {
+        setQuantities.push({ inventoryItemId: v.inventoryItem.id, locationId: lvl.location.id, quantity: 0 });
         report.push({
           locationId: lvl.location.id,
           locationName: lvl.location.name,
-          before: { onHand, available, committed, incoming },
+          before: { onHand: m.on_hand ?? 0, available: m.available ?? 0, committed: m.committed ?? 0, incoming: m.incoming ?? 0 },
           setOnHandTo: 0
         });
       }
     }
 
-    if (setQuantities.length === 0) {
-      return res.json({ ok: true, fixedCount: 0, message: 'La variante no tiene negativos 👌' });
-    }
+    if (setQuantities.length === 0) return res.json({ ok: true, fixedCount: 0, message: 'La variante no tiene negativos 👌' });
 
     const input = { reason: 'correction', setQuantities };
     const resp = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
-
     const errs = resp.inventorySetOnHandQuantities.userErrors || [];
-    if (errs.length) {
-      return res.status(400).json({ ok: false, userErrors: errs, attempted: report });
-    }
+    if (errs.length) return res.status(400).json({ ok: false, userErrors: errs, attempted: report });
 
     const changes = resp.inventorySetOnHandQuantities.inventoryAdjustmentGroup?.changes || [];
-    return res.json({ ok: true, fixedCount: setQuantities.length, report, changes });
+    res.json({ ok: true, fixedCount: setQuantities.length, report, changes });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ---- Global: dry (toda la tienda, no toca nada) ----
+// admite ?exclude=ECI para saltar locations que contengan esa cadena
+app.get('/auto-dry', async (req, res) => {
+  try {
+    const exclude = req.query.exclude || null;
+    const corrections = await scanAllNegatives({ excludeLocationContains: exclude });
+    res.json({
+      ok: true,
+      mode: 'dry-run',
+      toFixCount: corrections.length,
+      sample: corrections.slice(0, 50), // muestra
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ---- Global: fix (toda la tienda, corrige) ----
+app.get('/auto-fix', async (req, res) => {
+  try {
+    const exclude = req.query.exclude || null;
+    const corrections = await scanAllNegatives({ excludeLocationContains: exclude });
+    if (corrections.length === 0) return res.json({ ok: true, fixedCount: 0, message: 'No hay negativos que corregir 👌' });
+
+    const results = await applyBatches(corrections, 'correction');
+    res.json({
+      ok: true,
+      fixedCount: corrections.length,
+      batches: results.length
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: e.message });
