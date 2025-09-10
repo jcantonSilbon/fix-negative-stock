@@ -87,12 +87,17 @@ const INVENTORY_SET_ON_HAND = `
 function mapQuantities(qs) {
   return Object.fromEntries(qs.map(q => [q.name, q.quantity]));
 }
-function shouldFix(map) {
+
+// raise = true permite corregir available<0 aunque committed>0 (subiendo on_hand hasta committed)
+function shouldFix(map, raise = false) {
   const onHand = map.on_hand ?? 0;
   const available = map.available ?? 0;
   const committed = map.committed ?? 0;
   const incoming = map.incoming ?? 0;
-  return onHand < 0 || (available < 0 && committed === 0 && incoming === 0);
+  return (
+    onHand < 0 ||
+    (available < 0 && (committed === 0 || (raise && committed > 0)) && incoming === 0)
+  );
 }
 
 // Trae niveles de UNA variante (usa VARIANT_WITH_LEVELS)
@@ -118,7 +123,7 @@ async function scanAllNegatives({ excludeLocationContains, maxPages = null, conc
       if (excludeLocationContains && lvl.location.name?.includes(excludeLocationContains)) continue;
 
       const m = mapQuantities(lvl.quantities);
-      if (shouldFix(m)) {
+      if (shouldFix(m, raise)) {
         const target = (raise && (m.committed ?? 0) > 0) ? (m.committed ?? 0) : 0;
         corrections.push({
           inventoryItemId: v.inventoryItem.id,
@@ -188,7 +193,7 @@ async function applyBatches(corrections, reason = 'correction') {
       // referenceDocumentUri opcional si quieres dejar rastro externo
     };
     const resp = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
-    results.push(resp.inventorySetOnHandQuantities); 
+    results.push(resp.inventorySetOnHandQuantities);
 
     // pequeño respiro para ir suaves con el API
     await new Promise(r => setTimeout(r, 200));
@@ -209,7 +214,7 @@ app.get('/env-check', (_, res) => {
 // ---- Variante: dry ----
 app.get('/variant-dry', async (req, res) => {
   try {
-    const { variantId, variantGid } = req.query;
+    const { variantId, variantGid, raise } = req.query;
     const gid = toGidVariant(variantGid || variantId);
     if (!variantId && !variantGid) {
       return res.status(400).json({ ok: false, error: 'Falta ?variantId= o ?variantGid=' });
@@ -223,7 +228,8 @@ app.get('/variant-dry', async (req, res) => {
     const items = [];
     for (const { node: lvl } of v.inventoryItem.inventoryLevels.edges) {
       const m = mapQuantities(lvl.quantities);
-      if (shouldFix(m)) {
+      if (shouldFix(m, raise === '1')) {
+        const target = (raise === '1' && (m.committed ?? 0) > 0) ? (m.committed ?? 0) : 0;
         items.push({
           inventoryItemId: v.inventoryItem.id,
           variantId: v.id,
@@ -231,7 +237,7 @@ app.get('/variant-dry', async (req, res) => {
           productTitle: v.product?.title || '',
           locationId: lvl.location.id,
           locationName: lvl.location.name,
-          setOnHandTo: 0,
+          setOnHandTo: target,
           before: { onHand: m.on_hand ?? 0, available: m.available ?? 0, committed: m.committed ?? 0, incoming: m.incoming ?? 0 }
         });
       }
@@ -261,7 +267,7 @@ app.get('/variant-fix', async (req, res) => {
     const report = [];
     for (const { node: lvl } of v.inventoryItem.inventoryLevels.edges) {
       const m = mapQuantities(lvl.quantities);
-      if (shouldFix(m)) {
+      if (shouldFix(m, raise === '1')) {
         const target = (raise === '1' && (m.committed ?? 0) > 0) ? (m.committed ?? 0) : 0;
         setQuantities.push({ inventoryItemId: v.inventoryItem.id, locationId: lvl.location.id, quantity: target });
         report.push({
