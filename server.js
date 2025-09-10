@@ -161,7 +161,7 @@ app.get('/variant-fix', async (req, res) => {
       return res.json({ ok: true, fixedCount: 0, message: 'La variante no tiene negativos 👌' });
     }
 
-    const input = { reason: 'correction: single-variant', setQuantities };
+    const input = { reason: 'correction', setQuantities };
     const resp = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
 
     const errs = resp.inventorySetOnHandQuantities.userErrors || [];
