@@ -52,6 +52,19 @@ const VARIANT_WITH_LEVELS = `
   }
 `;
 
+const INVENTORY_SET_ON_HAND = `
+  mutation SetOnHand($input: InventorySetOnHandQuantitiesInput!) {
+    inventorySetOnHandQuantities(input: $input) {
+      userErrors { field message }
+      inventoryAdjustmentGroup {
+        createdAt
+        reason
+        changes { name delta }
+      }
+    }
+  }
+`;
+
 app.get('/health', (_, res) => res.send('OK'));
 app.get('/env-check', (_, res) => {
   res.json({
@@ -60,7 +73,6 @@ app.get('/env-check', (_, res) => {
     HAS_TOKEN: !!process.env.SHOPIFY_ADMIN_TOKEN // true/false, no mostramos el token
   });
 });
-
 
 app.get('/variant-dry', async (req, res) => {
   try {
@@ -100,6 +112,65 @@ app.get('/variant-dry', async (req, res) => {
     }
 
     res.json({ ok: true, mode: 'dry-run', toFixCount: corrections.length, items: corrections });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// nuevo endpoint para arreglar la variante
+app.get('/variant-fix', async (req, res) => {
+  try {
+    const { variantId, variantGid } = req.query;
+    const gid = toGidVariant(variantGid || variantId);
+    if (!variantId && !variantGid) {
+      return res.status(400).json({ ok: false, error: 'Falta ?variantId= o ?variantGid=' });
+    }
+
+    const data = await shopifyGraphQL(VARIANT_WITH_LEVELS, { id: gid });
+    const v = data.productVariant;
+    if (!v) return res.status(404).json({ ok: false, error: 'Variante no encontrada' });
+    if (!v.inventoryItem?.tracked) return res.json({ ok: true, fixedCount: 0, note: 'inventoryItem no tracked' });
+
+    const setQuantities = [];
+    const report = [];
+    for (const { node: lvl } of v.inventoryItem.inventoryLevels.edges) {
+      const map = Object.fromEntries(lvl.quantities.map(q => [q.name, q.quantity]));
+      const onHand = map.on_hand ?? 0;
+      const available = map.available ?? 0;
+      const committed = map.committed ?? 0;
+      const incoming = map.incoming ?? 0;
+
+      const shouldFix = onHand < 0 || (available < 0 && committed === 0 && incoming === 0);
+      if (shouldFix) {
+        setQuantities.push({
+          inventoryItemId: v.inventoryItem.id,
+          locationId: lvl.location.id,
+          quantity: 0
+        });
+        report.push({
+          locationId: lvl.location.id,
+          locationName: lvl.location.name,
+          before: { onHand, available, committed, incoming },
+          setOnHandTo: 0
+        });
+      }
+    }
+
+    if (setQuantities.length === 0) {
+      return res.json({ ok: true, fixedCount: 0, message: 'La variante no tiene negativos 👌' });
+    }
+
+    const input = { reason: 'correction: single-variant', setQuantities };
+    const resp = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
+
+    const errs = resp.inventorySetOnHandQuantities.userErrors || [];
+    if (errs.length) {
+      return res.status(400).json({ ok: false, userErrors: errs, attempted: report });
+    }
+
+    const changes = resp.inventorySetOnHandQuantities.inventoryAdjustmentGroup?.changes || [];
+    return res.json({ ok: true, fixedCount: setQuantities.length, report, changes });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: e.message });
