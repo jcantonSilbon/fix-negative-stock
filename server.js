@@ -102,12 +102,13 @@ async function fetchVariantLevels(variantIdGid) {
 }
 
 // Escaneo global evitando coste excesivo: productos -> IDs variantes -> niveles por variante
-async function scanAllNegatives({ excludeLocationContains } = {}) {
+async function scanAllNegatives({ excludeLocationContains, maxPages = null, concurrency = 5 } = {}) {
   let cursor = null, hasNext = true;
   const corrections = [];
 
-  const CONCURRENCY = 5; // nº de variantes en paralelo como máximo
+  const CONCURRENCY = Math.max(1, Number(concurrency) || 5);
   const queue = [];
+  let pages = 0;
 
   async function processVariant(vNode, productTitle) {
     const v = await fetchVariantLevels(vNode.id);
@@ -140,6 +141,9 @@ async function scanAllNegatives({ excludeLocationContains } = {}) {
   }
 
   while (hasNext) {
+    if (maxPages && pages >= maxPages) break;
+    pages++;
+
     const data = await shopifyGraphQL(PRODUCTS_VARIANT_IDS, { cursor });
     const { edges, pageInfo } = data.products;
     hasNext = pageInfo.hasNextPage;
@@ -287,7 +291,9 @@ app.get('/variant-fix', async (req, res) => {
 app.get('/auto-dry', async (req, res) => {
   try {
     const exclude = req.query.exclude || null;
-    const corrections = await scanAllNegatives({ excludeLocationContains: exclude });
+    const pages = req.query.pages ? Number(req.query.pages) : null; // ej: ?pages=1
+    const c = req.query.c ? Number(req.query.c) : 5;                // ej: ?c=5
+    const corrections = await scanAllNegatives({ excludeLocationContains: exclude, maxPages: pages, concurrency: c });
     res.json({
       ok: true,
       mode: 'dry-run',
@@ -304,7 +310,9 @@ app.get('/auto-dry', async (req, res) => {
 app.get('/auto-fix', async (req, res) => {
   try {
     const exclude = req.query.exclude || null;
-    const corrections = await scanAllNegatives({ excludeLocationContains: exclude });
+    const pages = req.query.pages ? Number(req.query.pages) : null;
+    const c = req.query.c ? Number(req.query.c) : 5;
+    const corrections = await scanAllNegatives({ excludeLocationContains: exclude, maxPages: pages, concurrency: c });
     if (corrections.length === 0) return res.json({ ok: true, fixedCount: 0, message: 'No hay negativos que corregir 👌' });
 
     const results = await applyBatches(corrections, 'correction');
