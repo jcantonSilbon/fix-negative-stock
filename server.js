@@ -34,20 +34,20 @@ async function shopifyGraphQL(query, variables = {}) {
   return json.data;
 }
 
-// ===== QUERIES / MUTATIONS =====
+// ===== QUERIES / MUTATIONS (LIVE) =====
 const VARIANT_WITH_LEVELS = `
   query VariantWithLevels($id: ID!) {
     productVariant(id: $id) {
       id
       sku
-      product { title }
+      product { id }
       inventoryItem {
         id
         tracked
         inventoryLevels(first: 100) {
           edges {
             node {
-              location { id name }
+              location { id }
               quantities(names: ["on_hand","available","committed","incoming"]) {
                 name
                 quantity
@@ -60,14 +60,13 @@ const VARIANT_WITH_LEVELS = `
   }
 `;
 
-// Query ligera: productos -> IDs de variantes (sin niveles)
 const PRODUCTS_VARIANT_IDS = `
   query ProductsVariantIds($cursor: String) {
     products(first: 20, after: $cursor) {
       pageInfo { hasNextPage endCursor }
       edges {
         node {
-          title
+          id
           variants(first: 100) {
             edges { node { id sku } }
           }
@@ -115,25 +114,46 @@ const BULK_STATUS = `
   }
 `;
 
-// Query bulk: todas las variantes con niveles por localización (formato NDJSON)
-function buildBulkQuery() {
+const BULK_CANCEL_WITH_ID = `
+  mutation bulkCancel($id: ID!) {
+    bulkOperationCancel(id: $id) { userErrors { field message } }
+  }
+`;
+
+/**
+ * Bulk minimalísima (rápida):
+ * - product { id }
+ * - variant { id, sku }
+ * - inventoryItem { id }
+ * - inventoryLevels { location { id }, quantities(on_hand,available,committed,incoming) }
+ * Sin títulos ni location.name para bajar el objectCount.
+ * Se puede particionar con ?q=... (search) de Shopify (title, vendor, product_type, updated_at, etc.)
+ */
+function buildBulkQuery({ search = null } = {}) {
+  const queryArg = search ? `(query: ${JSON.stringify(search)})` : '';
   return `
   {
-    productVariants {
+    products${queryArg} {
       edges {
         node {
           id
-          sku
-          product { title }
-          inventoryItem {
-            id
-            inventoryLevels {
-              edges {
-                node {
-                  location { id name }
-                  quantities(names: ["on_hand","available","committed","incoming"]) {
-                    name
-                    quantity
+          variants(first: 250) {
+            edges {
+              node {
+                id
+                sku
+                inventoryItem {
+                  id
+                  inventoryLevels {
+                    edges {
+                      node {
+                        location { id }
+                        quantities(names: ["on_hand","available","committed","incoming"]) {
+                          name
+                          quantity
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -150,40 +170,35 @@ function mapQuantities(qs) {
   return Object.fromEntries(qs.map(q => [q.name, q.quantity]));
 }
 
-// raise = true permite corregir available<0 aunque committed>0 (subiendo on_hand hasta committed)
+// raise = true -> si available<0 pero committed>0, subimos on_hand a committed
 function shouldFix(map, raise = false) {
   const onHand = map.on_hand ?? 0;
   const available = map.available ?? 0;
   const committed = map.committed ?? 0;
   const incoming = map.incoming ?? 0;
-  return (
-    onHand < 0 ||
-    (available < 0 && (committed === 0 || (raise && committed > 0)) && incoming === 0)
-  );
+  return (onHand < 0) || (available < 0 && (committed === 0 || (raise && committed > 0)) && incoming === 0);
 }
 
-// Trae niveles de UNA variante (usa VARIANT_WITH_LEVELS)
+// Trae niveles de UNA variante (live)
 async function fetchVariantLevels(variantIdGid) {
   const data = await shopifyGraphQL(VARIANT_WITH_LEVELS, { id: variantIdGid });
   return data.productVariant || null;
 }
 
-// Escaneo global evitando coste excesivo: productos -> IDs variantes -> niveles por variante
+// Escaneo live limitado (pages/concurrency) para pruebas rápidas
 async function scanAllNegatives({ excludeLocationContains, maxPages = null, concurrency = 5, raise = false } = {}) {
   let cursor = null, hasNext = true;
   const corrections = [];
-
   const CONCURRENCY = Math.max(1, Number(concurrency) || 5);
   const queue = [];
   let pages = 0;
 
-  async function processVariant(vNode, productTitle) {
+  async function processVariant(vNode, productId) {
     const v = await fetchVariantLevels(vNode.id);
     if (!v?.inventoryItem?.tracked) return;
 
     for (const { node: lvl } of v.inventoryItem.inventoryLevels.edges) {
-      if (excludeLocationContains && lvl.location.name?.includes(excludeLocationContains)) continue;
-
+      if (excludeLocationContains && String(lvl.location.id).includes(excludeLocationContains)) continue;
       const m = mapQuantities(lvl.quantities);
       if (shouldFix(m, raise)) {
         const target = (raise && (m.committed ?? 0) > 0) ? (m.committed ?? 0) : 0;
@@ -192,10 +207,9 @@ async function scanAllNegatives({ excludeLocationContains, maxPages = null, conc
           locationId: lvl.location.id,
           setOnHandTo: target,
           meta: {
+            productId,
             variantId: v.id,
             sku: v.sku || vNode.sku || 'NO-SKU',
-            productTitle,
-            locationName: lvl.location.name,
             before: {
               onHand: m.on_hand ?? 0,
               available: m.available ?? 0,
@@ -218,30 +232,25 @@ async function scanAllNegatives({ excludeLocationContains, maxPages = null, conc
     cursor = pageInfo.endCursor;
 
     for (const pe of edges) {
-      const productTitle = pe.node.title;
+      const productId = pe.node.id;
       for (const ve of pe.node.variants.edges) {
-        const p = processVariant(ve.node, productTitle).catch(() => {});
+        const p = processVariant(ve.node, productId).catch(() => {});
         queue.push(p);
         if (queue.length >= CONCURRENCY) {
           await Promise.race(queue);
-          // limpia resueltas
-          for (let i = queue.length - 1; i >= 0; i--) {
-            if (queue[i].settled) queue.splice(i, 1);
-          }
+          for (let i = queue.length - 1; i >= 0; i--) if (queue[i].settled) queue.splice(i, 1);
         }
-        // marca settled para limpieza simple
         p.finally(() => { p.settled = true; });
       }
     }
   }
 
-  // espera a que acaben todas
   await Promise.allSettled(queue);
   return corrections;
 }
 
 async function applyBatches(corrections, reason = 'correction') {
-  const BATCH = 200; // bajo el límite (250)
+  const BATCH = 200; // límite seguro
   const results = [];
   for (let i = 0; i < corrections.length; i += BATCH) {
     const batch = corrections.slice(i, i + BATCH);
@@ -252,13 +261,10 @@ async function applyBatches(corrections, reason = 'correction') {
         locationId: c.locationId,
         quantity: (typeof c.setOnHandTo === 'number') ? c.setOnHandTo : 0
       }))
-      // referenceDocumentUri opcional si quieres dejar rastro externo
     };
     const resp = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
     results.push(resp.inventorySetOnHandQuantities);
-
-    // pequeño respiro para ir suaves con el API
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise(r => setTimeout(r, 200)); // respira
   }
   return results;
 }
@@ -268,46 +274,59 @@ function* parseNdjsonLines(str) {
   const lines = str.split(/\r?\n/);
   for (const line of lines) {
     if (!line.trim()) continue;
-    try { yield JSON.parse(line); } catch { /* ignorar líneas corruptas */ }
+    try { yield JSON.parse(line); } catch { /* ignora línea corrupta */ }
   }
 }
 
-function collectCorrectionsFromBulkNode(node, { exclude, raise }) {
+/**
+ * node shape (bulk minimal):
+ * {
+ *   id: "gid://shopify/Product/...",
+ *   variants: { edges: [ { node: {
+ *      id, sku,
+ *      inventoryItem: {
+ *        id,
+ *        inventoryLevels: { edges: [ { node: { location:{id}, quantities:[...] } } ] }
+ *      }
+ *   }} ] }
+ * }
+ */
+function collectCorrectionsFromBulkProductNode(productNode, { excludeLocationIdContains, raise }) {
   const out = [];
-  const v = node; // productVariant node
-  const invItem = v?.inventoryItem;
-  if (!invItem) return out;
+  const variants = productNode?.variants?.edges || [];
+  for (const ve of variants) {
+    const v = ve?.node;
+    if (!v?.inventoryItem) continue;
 
-  const levels = invItem.inventoryLevels?.edges || [];
-  for (const e of levels) {
-    const lvl = e.node;
-    if (!lvl) continue;
-    if (exclude && lvl.location?.name?.includes(exclude)) continue;
+    const levels = v.inventoryItem.inventoryLevels?.edges || [];
+    for (const e of levels) {
+      const lvl = e.node;
+      if (!lvl) continue;
+      const locId = lvl.location?.id;
+      if (excludeLocationIdContains && String(locId || '').includes(excludeLocationIdContains)) continue;
 
-    const qs = lvl.quantities || [];
-    const m = Object.fromEntries(qs.map(q => [q.name, q.quantity]));
-    const onHand = m.on_hand ?? 0;
-    const available = m.available ?? 0;
-    const committed = m.committed ?? 0;
-    const incoming = m.incoming ?? 0;
+      const m = Object.fromEntries((lvl.quantities || []).map(q => [q.name, q.quantity]));
+      const onHand = m.on_hand ?? 0;
+      const available = m.available ?? 0;
+      const committed = m.committed ?? 0;
+      const incoming = m.incoming ?? 0;
 
-    const fixable = onHand < 0 || (available < 0 && (committed === 0 || (raise && committed > 0)) && incoming === 0);
-    if (!fixable) continue;
+      const fixable = (onHand < 0) || (available < 0 && (committed === 0 || (raise && committed > 0)) && incoming === 0);
+      if (!fixable) continue;
 
-    const target = (raise && committed > 0) ? committed : 0;
-
-    out.push({
-      inventoryItemId: invItem.id,
-      locationId: lvl.location?.id,
-      setOnHandTo: target,
-      meta: {
-        variantId: v.id,
-        sku: v.sku || 'NO-SKU',
-        productTitle: v.product?.title || '',
-        locationName: lvl.location?.name || '',
-        before: { onHand, available, committed, incoming }
-      }
-    });
+      const target = (raise && committed > 0) ? committed : 0;
+      out.push({
+        inventoryItemId: v.inventoryItem.id,
+        locationId: locId,
+        setOnHandTo: target,
+        meta: {
+          productId: productNode.id,
+          variantId: v.id,
+          sku: v.sku || 'NO-SKU',
+          before: { onHand, available, committed, incoming }
+        }
+      });
+    }
   }
   return out;
 }
@@ -322,17 +341,14 @@ app.get('/env-check', (_, res) => {
   });
 });
 
-// ---- Variante: dry ----
+// === LIVE (para pruebas pequeñas) ===
 app.get('/variant-dry', async (req, res) => {
   try {
     const { variantId, variantGid, raise } = req.query;
     const gid = toGidVariant(variantGid || variantId);
-    if (!variantId && !variantGid) {
-      return res.status(400).json({ ok: false, error: 'Falta ?variantId= o ?variantGid=' });
-    }
+    if (!variantId && !variantGid) return res.status(400).json({ ok: false, error: 'Falta ?variantId= o ?variantGid=' });
 
-    const data = await shopifyGraphQL(VARIANT_WITH_LEVELS, { id: gid });
-    const v = data.productVariant;
+    const v = await fetchVariantLevels(gid);
     if (!v) return res.status(404).json({ ok: false, error: 'Variante no encontrada' });
     if (!v.inventoryItem?.tracked) return res.json({ ok: true, toFixCount: 0, note: 'inventoryItem no tracked' });
 
@@ -345,9 +361,8 @@ app.get('/variant-dry', async (req, res) => {
           inventoryItemId: v.inventoryItem.id,
           variantId: v.id,
           sku: v.sku || 'NO-SKU',
-          productTitle: v.product?.title || '',
+          productId: v.product?.id,
           locationId: lvl.location.id,
-          locationName: lvl.location.name,
           setOnHandTo: target,
           before: { onHand: m.on_hand ?? 0, available: m.available ?? 0, committed: m.committed ?? 0, incoming: m.incoming ?? 0 }
         });
@@ -355,22 +370,17 @@ app.get('/variant-dry', async (req, res) => {
     }
     res.json({ ok: true, mode: 'dry-run', toFixCount: items.length, items });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ---- Variante: fix ----
 app.get('/variant-fix', async (req, res) => {
   try {
     const { variantId, variantGid, raise } = req.query;
     const gid = toGidVariant(variantGid || variantId);
-    if (!variantId && !variantGid) {
-      return res.status(400).json({ ok: false, error: 'Falta ?variantId= o ?variantGid=' });
-    }
+    if (!variantId && !variantGid) return res.status(400).json({ ok: false, error: 'Falta ?variantId= o ?variantGid=' });
 
-    const data = await shopifyGraphQL(VARIANT_WITH_LEVELS, { id: gid });
-    const v = data.productVariant;
+    const v = await fetchVariantLevels(gid);
     if (!v) return res.status(404).json({ ok: false, error: 'Variante no encontrada' });
     if (!v.inventoryItem?.tracked) return res.json({ ok: true, fixedCount: 0, note: 'inventoryItem no tracked' });
 
@@ -381,12 +391,7 @@ app.get('/variant-fix', async (req, res) => {
       if (shouldFix(m, raise === '1')) {
         const target = (raise === '1' && (m.committed ?? 0) > 0) ? (m.committed ?? 0) : 0;
         setQuantities.push({ inventoryItemId: v.inventoryItem.id, locationId: lvl.location.id, quantity: target });
-        report.push({
-          locationId: lvl.location.id,
-          locationName: lvl.location.name,
-          before: { onHand: m.on_hand ?? 0, available: m.available ?? 0, committed: m.committed ?? 0, incoming: m.incoming ?? 0 },
-          setOnHandTo: target
-        });
+        report.push({ locationId: lvl.location.id, setOnHandTo: target, before: { onHand: m.on_hand ?? 0, available: m.available ?? 0, committed: m.committed ?? 0, incoming: m.incoming ?? 0 } });
       }
     }
 
@@ -397,16 +402,12 @@ app.get('/variant-fix', async (req, res) => {
     const errs = resp.inventorySetOnHandQuantities.userErrors || [];
     if (errs.length) return res.status(400).json({ ok: false, userErrors: errs, attempted: report });
 
-    const changes = resp.inventorySetOnHandQuantities.inventoryAdjustmentGroup?.changes || [];
-    res.json({ ok: true, fixedCount: setQuantities.length, report, changes });
+    res.json({ ok: true, fixedCount: setQuantities.length, report });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ---- Global: dry (toda la tienda, no toca nada) ----
-// admite ?exclude=ECI para saltar locations que contengan esa cadena
 app.get('/auto-dry', async (req, res) => {
   try {
     const exclude = req.query.exclude || null;
@@ -414,19 +415,12 @@ app.get('/auto-dry', async (req, res) => {
     const c = req.query.c ? Number(req.query.c) : 5;
     const raise = req.query.raise === '1';
     const corrections = await scanAllNegatives({ excludeLocationContains: exclude, maxPages: pages, concurrency: c, raise });
-    res.json({
-      ok: true,
-      mode: 'dry-run',
-      toFixCount: corrections.length,
-      sample: corrections.slice(0, 50) // muestra
-    });
+    res.json({ ok: true, mode: 'dry-run', toFixCount: corrections.length, sample: corrections.slice(0, 50) });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ---- Global: fix (toda la tienda, corrige) ----
 app.get('/auto-fix', async (req, res) => {
   try {
     const exclude = req.query.exclude || null;
@@ -437,47 +431,63 @@ app.get('/auto-fix', async (req, res) => {
     if (corrections.length === 0) return res.json({ ok: true, fixedCount: 0, message: 'No hay negativos que corregir 👌' });
 
     const results = await applyBatches(corrections, 'correction');
-    res.json({
-      ok: true,
-      fixedCount: corrections.length,
-      batches: results.length
-    });
+    res.json({ ok: true, fixedCount: corrections.length, batches: results.length });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ===== BULK ROUTES =====
+// === BULK ROUTES (rápidas y particionables) ===
 
-// start: lanza la operación bulk
-app.post('/bulk-start', async (req, res) => {
+// Lanzar bulk (GET o POST). Permite ?q=... (search de Shopify).
+app.get('/bulk-start', async (req, res) => {
   try {
-    const query = buildBulkQuery();
+    const q = req.query.q || null; // ej: updated_at:>=2025-09-01
+    const query = buildBulkQuery({ search: q });
     const data = await shopifyGraphQL(BULK_RUN, { query });
     const errs = data.bulkOperationRunQuery.userErrors || [];
     if (errs.length) return res.status(400).json({ ok: false, userErrors: errs });
-
-    const op = data.bulkOperationRunQuery.bulkOperation;
-    res.json({ ok: true, started: op });
+    res.json({ ok: true, started: data.bulkOperationRunQuery.bulkOperation, filter: q || null });
   } catch (e) {
-    console.error(e);
+    res.status(500).json({ ok:false, error: e.message });
+  }
+});
+app.post('/bulk-start', async (req, res) => {
+  try {
+    const q = req.query.q || null;
+    const query = buildBulkQuery({ search: q });
+    const data = await shopifyGraphQL(BULK_RUN, { query });
+    const errs = data.bulkOperationRunQuery.userErrors || [];
+    if (errs.length) return res.status(400).json({ ok: false, userErrors: errs });
+    res.json({ ok: true, started: data.bulkOperationRunQuery.bulkOperation, filter: q || null });
+  } catch (e) {
     res.status(500).json({ ok:false, error: e.message });
   }
 });
 
-// status: progreso y url de archivo cuando termine
 app.get('/bulk-status', async (_req, res) => {
   try {
     const data = await shopifyGraphQL(BULK_STATUS);
     res.json({ ok: true, status: data.currentBulkOperation });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ ok:false, error: e.message });
   }
 });
 
-// download: baja el NDJSON a /tmp
+app.post('/bulk-cancel', async (_req, res) => {
+  try {
+    const st = await shopifyGraphQL(BULK_STATUS);
+    const op = st.currentBulkOperation;
+    if (!op || op.status !== 'RUNNING') return res.json({ ok:true, message:'No hay BULK RUNNING que cancelar', status: op || null });
+    const data = await shopifyGraphQL(BULK_CANCEL_WITH_ID, { id: op.id });
+    const errs = data.bulkOperationCancel.userErrors || [];
+    if (errs.length) return res.status(400).json({ ok:false, userErrors: errs });
+    res.json({ ok:true, cancelled: op.id });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
 app.get('/bulk-download', async (_req, res) => {
   try {
     const st = await shopifyGraphQL(BULK_STATUS);
@@ -485,74 +495,119 @@ app.get('/bulk-download', async (_req, res) => {
     if (!op || op.status !== 'COMPLETED' || !op.url) {
       return res.status(400).json({ ok:false, error:'Bulk no está COMPLETED o no hay url', status: op || null });
     }
-
-    const r = await fetch(op.url); // url pública temporal de Shopify
+    const r = await fetch(op.url);
     if (!r.ok) throw new Error(`descarga bulk falló: ${r.status}`);
     const text = await r.text();
-
     fs.writeFileSync(BULK_FILE, text, 'utf8');
     res.json({ ok:true, savedTo: BULK_FILE, bytes: Buffer.byteLength(text, 'utf8'), objectCount: op.objectCount });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ ok:false, error: e.message });
   }
 });
 
-// bulk-dry: lee NDJSON y muestra qué tocaríamos (sin tocar nada)
+// bulk-dry con límites y filtros (emula pages=1)
 app.get('/bulk-dry', async (req, res) => {
   try {
     if (!fs.existsSync(BULK_FILE)) return res.status(400).json({ ok:false, error:'No se encuentra el archivo bulk. Ejecuta /bulk-download primero.' });
 
     const text = fs.readFileSync(BULK_FILE, 'utf8');
-    const exclude = req.query.exclude || null;
     const raise = req.query.raise === '1';
+    const limitVariants = req.query.limitVariants ? Number(req.query.limitVariants) : null;   // ej: 20
+    const maxCorrections = req.query.maxCorrections ? Number(req.query.maxCorrections) : null; // ej: 50
     const onlyVariantId = req.query.onlyVariantId || null;
+    const excludeVariantId = req.query.excludeVariantId || null;
+    const filterSku = (req.query.filterSku || '').toLowerCase();
+    const excludeLocationIdContains = req.query.exclude || null; // usa substring de locationId
 
     const corrections = [];
-    for (const obj of parseNdjsonLines(text)) {
-      const node = obj?.id && obj?.inventoryItem ? obj : obj?.node || obj;
-      if (!node?.id) continue;
-      if (onlyVariantId && node.id !== onlyVariantId) continue;
+    let variantsSeen = 0;
 
-      corrections.push(...collectCorrectionsFromBulkNode(node, { exclude, raise }));
+    for (const obj of parseNdjsonLines(text)) {
+      const productNode = obj?.id && obj?.variants ? obj : obj?.node || obj;
+      if (!productNode?.id) continue;
+
+      const vEdges = productNode.variants?.edges || [];
+      for (const ve of vEdges) {
+        const v = ve?.node;
+        if (!v?.id || !v?.inventoryItem) continue;
+
+        if (onlyVariantId && v.id !== onlyVariantId) continue;
+        if (excludeVariantId && v.id === excludeVariantId) continue;
+        if (filterSku && !(String(v.sku || '').toLowerCase().includes(filterSku))) continue;
+
+        variantsSeen++;
+        if (limitVariants && variantsSeen > limitVariants) break;
+
+        const items = collectCorrectionsFromBulkProductNode(
+          { id: productNode.id, variants: { edges: [ { node: v } ] } },
+          { excludeLocationIdContains, raise }
+        );
+        for (const it of items) {
+          corrections.push(it);
+          if (maxCorrections && corrections.length >= maxCorrections) {
+            return res.json({ ok:true, mode:'dry-run (bulk file)', toFixCount: corrections.length, sample: corrections });
+          }
+        }
+      }
+      if (limitVariants && variantsSeen >= limitVariants) break;
     }
 
     res.json({ ok:true, mode:'dry-run (bulk file)', toFixCount: corrections.length, sample: corrections.slice(0, 50) });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ ok:false, error: e.message });
   }
 });
 
-// bulk-fix: aplica fixes leyendo el NDJSON (con filtros)
+// bulk-fix (desde archivo) con límites/filtros
 app.get('/bulk-fix', async (req, res) => {
   try {
     if (!fs.existsSync(BULK_FILE)) return res.status(400).json({ ok:false, error:'No se encuentra el archivo bulk. Ejecuta /bulk-download primero.' });
 
     const text = fs.readFileSync(BULK_FILE, 'utf8');
-    const exclude = req.query.exclude || null;
     const raise = req.query.raise === '1';
+    const limitVariants = req.query.limitVariants ? Number(req.query.limitVariants) : null;
+    const maxCorrections = req.query.maxCorrections ? Number(req.query.maxCorrections) : null;
     const onlyVariantId = req.query.onlyVariantId || null;
     const excludeVariantId = req.query.excludeVariantId || null;
+    const filterSku = (req.query.filterSku || '').toLowerCase();
+    const excludeLocationIdContains = req.query.exclude || null;
 
     const corrections = [];
+    let variantsSeen = 0;
+
     for (const obj of parseNdjsonLines(text)) {
-      const node = obj?.id && obj?.inventoryItem ? obj : obj?.node || obj;
-      if (!node?.id) continue;
-      if (onlyVariantId && node.id !== onlyVariantId) continue;
-      if (excludeVariantId && node.id === excludeVariantId) continue;
+      const productNode = obj?.id && obj?.variants ? obj : obj?.node || obj;
+      if (!productNode?.id) continue;
 
-      corrections.push(...collectCorrectionsFromBulkNode(node, { exclude, raise }));
+      const vEdges = productNode.variants?.edges || [];
+      for (const ve of vEdges) {
+        const v = ve?.node;
+        if (!v?.id || !v?.inventoryItem) continue;
+
+        if (onlyVariantId && v.id !== onlyVariantId) continue;
+        if (excludeVariantId && v.id === excludeVariantId) continue;
+        if (filterSku && !(String(v.sku || '').toLowerCase().includes(filterSku))) continue;
+
+        variantsSeen++;
+        if (limitVariants && variantsSeen > limitVariants) break;
+
+        const items = collectCorrectionsFromBulkProductNode(
+          { id: productNode.id, variants: { edges: [ { node: v } ] } },
+          { excludeLocationIdContains, raise }
+        );
+        for (const it of items) {
+          corrections.push(it);
+          if (maxCorrections && corrections.length >= maxCorrections) break;
+        }
+      }
+      if ((limitVariants && variantsSeen >= limitVariants) || (maxCorrections && corrections.length >= maxCorrections)) break;
     }
 
-    if (corrections.length === 0) {
-      return res.json({ ok:true, fixedCount: 0, message: 'Nada que corregir con los filtros dados.' });
-    }
+    if (corrections.length === 0) return res.json({ ok:true, fixedCount: 0, message: 'Nada que corregir con los filtros/límites dados.' });
 
     const results = await applyBatches(corrections, 'correction');
-    res.json({ ok:true, fixedCount: corrections.length, batches: results.length });
+    res.json({ ok:true, fixedCount: corrections.length, batches: results.length, sample: corrections.slice(0, 20) });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ ok:false, error: e.message });
   }
 });
