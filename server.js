@@ -130,31 +130,22 @@ const BULK_CANCEL_WITH_ID = `
  * Se puede particionar con ?q=... (search) de Shopify (title, vendor, product_type, updated_at, etc.)
  */
 function buildBulkQuery({ search = null } = {}) {
+  // Ojo: el "query:" para inventoryItems es limitado. Si no te filtra, particiona por vendor/product_type con products (plan B).
   const queryArg = search ? `(query: ${JSON.stringify(search)})` : '';
   return `
   {
-    products${queryArg} {
+    inventoryItems${queryArg} {
       edges {
         node {
           id
-          variants(first: 250) {
+          sku        # suele existir en InventoryItem y nos viene bien para filtrar
+          inventoryLevels {
             edges {
               node {
-                id
-                sku
-                inventoryItem {
-                  id
-                  inventoryLevels {
-                    edges {
-                      node {
-                        location { id }
-                        quantities(names: ["on_hand","available","committed","incoming"]) {
-                          name
-                          quantity
-                        }
-                      }
-                    }
-                  }
+                location { id }   # solo id; el name lo resolvemos luego si hiciera falta
+                quantities(names: ["on_hand","available","committed","incoming"]) {
+                  name
+                  quantity
                 }
               }
             }
@@ -164,6 +155,7 @@ function buildBulkQuery({ search = null } = {}) {
     }
   }`;
 }
+
 
 // ===== HELPERS =====
 function mapQuantities(qs) {
@@ -291,45 +283,40 @@ function* parseNdjsonLines(str) {
  *   }} ] }
  * }
  */
-function collectCorrectionsFromBulkProductNode(productNode, { excludeLocationIdContains, raise }) {
+function collectCorrectionsFromBulkInventoryItemNode(invItemNode, { excludeLocationIdContains, raise }) {
   const out = [];
-  const variants = productNode?.variants?.edges || [];
-  for (const ve of variants) {
-    const v = ve?.node;
-    if (!v?.inventoryItem) continue;
+  const levels = invItemNode?.inventoryLevels?.edges || [];
+  for (const e of levels) {
+    const lvl = e?.node;
+    if (!lvl) continue;
 
-    const levels = v.inventoryItem.inventoryLevels?.edges || [];
-    for (const e of levels) {
-      const lvl = e.node;
-      if (!lvl) continue;
-      const locId = lvl.location?.id;
-      if (excludeLocationIdContains && String(locId || '').includes(excludeLocationIdContains)) continue;
+    const locId = lvl.location?.id;
+    if (excludeLocationIdContains && String(locId || '').includes(excludeLocationIdContains)) continue;
 
-      const m = Object.fromEntries((lvl.quantities || []).map(q => [q.name, q.quantity]));
-      const onHand = m.on_hand ?? 0;
-      const available = m.available ?? 0;
-      const committed = m.committed ?? 0;
-      const incoming = m.incoming ?? 0;
+    const m = Object.fromEntries((lvl.quantities || []).map(q => [q.name, q.quantity]));
+    const onHand = m.on_hand ?? 0;
+    const available = m.available ?? 0;
+    const committed = m.committed ?? 0;
+    const incoming = m.incoming ?? 0;
 
-      const fixable = (onHand < 0) || (available < 0 && (committed === 0 || (raise && committed > 0)) && incoming === 0);
-      if (!fixable) continue;
+    const fixable = (onHand < 0) || (available < 0 && (committed === 0 || (raise && committed > 0)) && incoming === 0);
+    if (!fixable) continue;
 
-      const target = (raise && committed > 0) ? committed : 0;
-      out.push({
-        inventoryItemId: v.inventoryItem.id,
-        locationId: locId,
-        setOnHandTo: target,
-        meta: {
-          productId: productNode.id,
-          variantId: v.id,
-          sku: v.sku || 'NO-SKU',
-          before: { onHand, available, committed, incoming }
-        }
-      });
-    }
+    const target = (raise && committed > 0) ? committed : 0;
+
+    out.push({
+      inventoryItemId: invItemNode.id,
+      locationId: locId,
+      setOnHandTo: target,
+      meta: {
+        sku: invItemNode.sku || 'NO-SKU',
+        before: { onHand, available, committed, incoming }
+      }
+    });
   }
   return out;
 }
+
 
 // ===== ROUTES =====
 app.get('/health', (_, res) => res.send('OK'));
@@ -508,102 +495,89 @@ app.get('/bulk-download', async (_req, res) => {
 // bulk-dry con límites y filtros (emula pages=1)
 app.get('/bulk-dry', async (req, res) => {
   try {
-    if (!fs.existsSync(BULK_FILE)) return res.status(400).json({ ok:false, error:'No se encuentra el archivo bulk. Ejecuta /bulk-download primero.' });
-
-    const text = fs.readFileSync(BULK_FILE, 'utf8');
-    const raise = req.query.raise === '1';
-    const limitVariants = req.query.limitVariants ? Number(req.query.limitVariants) : null;   // ej: 20
-    const maxCorrections = req.query.maxCorrections ? Number(req.query.maxCorrections) : null; // ej: 50
-    const onlyVariantId = req.query.onlyVariantId || null;
-    const excludeVariantId = req.query.excludeVariantId || null;
-    const filterSku = (req.query.filterSku || '').toLowerCase();
-    const excludeLocationIdContains = req.query.exclude || null; // usa substring de locationId
-
-    const corrections = [];
-    let variantsSeen = 0;
-
-    for (const obj of parseNdjsonLines(text)) {
-      const productNode = obj?.id && obj?.variants ? obj : obj?.node || obj;
-      if (!productNode?.id) continue;
-
-      const vEdges = productNode.variants?.edges || [];
-      for (const ve of vEdges) {
-        const v = ve?.node;
-        if (!v?.id || !v?.inventoryItem) continue;
-
-        if (onlyVariantId && v.id !== onlyVariantId) continue;
-        if (excludeVariantId && v.id === excludeVariantId) continue;
-        if (filterSku && !(String(v.sku || '').toLowerCase().includes(filterSku))) continue;
-
-        variantsSeen++;
-        if (limitVariants && variantsSeen > limitVariants) break;
-
-        const items = collectCorrectionsFromBulkProductNode(
-          { id: productNode.id, variants: { edges: [ { node: v } ] } },
-          { excludeLocationIdContains, raise }
-        );
-        for (const it of items) {
-          corrections.push(it);
-          if (maxCorrections && corrections.length >= maxCorrections) {
-            return res.json({ ok:true, mode:'dry-run (bulk file)', toFixCount: corrections.length, sample: corrections });
-          }
-        }
-      }
-      if (limitVariants && variantsSeen >= limitVariants) break;
+    if (!fs.existsSync(BULK_FILE)) {
+      return res.status(400).json({ ok:false, error:'No se encuentra el archivo bulk. Ejecuta /bulk-download primero.' });
     }
 
-    res.json({ ok:true, mode:'dry-run (bulk file)', toFixCount: corrections.length, sample: corrections.slice(0, 50) });
+    const text = fs.readFileSync(BULK_FILE, 'utf8');
+
+    const raise = req.query.raise === '1';
+    const limitItems = req.query.limitItems ? Number(req.query.limitItems) : null;         // nuevo: limita inventoryItems procesados
+    const maxCorrections = req.query.maxCorrections ? Number(req.query.maxCorrections) : null;
+    const onlyInventoryItemId = req.query.onlyInventoryItemId || null;                     // nuevo
+    const filterSku = (req.query.filterSku || '').toLowerCase();
+    const excludeLocationIdContains = req.query.exclude || null;
+
+    const corrections = [];
+    let itemsSeen = 0;
+
+    for (const obj of parseNdjsonLines(text)) {
+      // En esta bulk, cada línea es un inventoryItem (o edge.node con inventoryItem)
+      const node = obj?.id && obj?.inventoryLevels ? obj : obj?.node || obj;
+      if (!node?.id || !node?.inventoryLevels) continue;
+
+      if (onlyInventoryItemId && node.id !== onlyInventoryItemId) continue;
+      if (filterSku && !(String(node.sku || '').toLowerCase().includes(filterSku))) continue;
+
+      itemsSeen++;
+      if (limitItems && itemsSeen > limitItems) break;
+
+      const items = collectCorrectionsFromBulkInventoryItemNode(node, { excludeLocationIdContains, raise });
+      for (const it of items) {
+        corrections.push(it);
+        if (maxCorrections && corrections.length >= maxCorrections) {
+          return res.json({ ok:true, mode:'dry-run (bulk file: inventoryItems)', toFixCount: corrections.length, sample: corrections });
+        }
+      }
+    }
+
+    res.json({ ok:true, mode:'dry-run (bulk file: inventoryItems)', toFixCount: corrections.length, sample: corrections.slice(0, 50) });
   } catch (e) {
     res.status(500).json({ ok:false, error: e.message });
   }
 });
 
+
 // bulk-fix (desde archivo) con límites/filtros
 app.get('/bulk-fix', async (req, res) => {
   try {
-    if (!fs.existsSync(BULK_FILE)) return res.status(400).json({ ok:false, error:'No se encuentra el archivo bulk. Ejecuta /bulk-download primero.' });
+    if (!fs.existsSync(BULK_FILE)) {
+      return res.status(400).json({ ok:false, error:'No se encuentra el archivo bulk. Ejecuta /bulk-download primero.' });
+    }
 
     const text = fs.readFileSync(BULK_FILE, 'utf8');
+
     const raise = req.query.raise === '1';
-    const limitVariants = req.query.limitVariants ? Number(req.query.limitVariants) : null;
+    const limitItems = req.query.limitItems ? Number(req.query.limitItems) : null;
     const maxCorrections = req.query.maxCorrections ? Number(req.query.maxCorrections) : null;
-    const onlyVariantId = req.query.onlyVariantId || null;
-    const excludeVariantId = req.query.excludeVariantId || null;
+    const onlyInventoryItemId = req.query.onlyInventoryItemId || null;
     const filterSku = (req.query.filterSku || '').toLowerCase();
     const excludeLocationIdContains = req.query.exclude || null;
 
     const corrections = [];
-    let variantsSeen = 0;
+    let itemsSeen = 0;
 
     for (const obj of parseNdjsonLines(text)) {
-      const productNode = obj?.id && obj?.variants ? obj : obj?.node || obj;
-      if (!productNode?.id) continue;
+      const node = obj?.id && obj?.inventoryLevels ? obj : obj?.node || obj;
+      if (!node?.id || !node?.inventoryLevels) continue;
 
-      const vEdges = productNode.variants?.edges || [];
-      for (const ve of vEdges) {
-        const v = ve?.node;
-        if (!v?.id || !v?.inventoryItem) continue;
+      if (onlyInventoryItemId && node.id !== onlyInventoryItemId) continue;
+      if (filterSku && !(String(node.sku || '').toLowerCase().includes(filterSku))) continue;
 
-        if (onlyVariantId && v.id !== onlyVariantId) continue;
-        if (excludeVariantId && v.id === excludeVariantId) continue;
-        if (filterSku && !(String(v.sku || '').toLowerCase().includes(filterSku))) continue;
+      itemsSeen++;
+      if (limitItems && itemsSeen > limitItems) break;
 
-        variantsSeen++;
-        if (limitVariants && variantsSeen > limitVariants) break;
-
-        const items = collectCorrectionsFromBulkProductNode(
-          { id: productNode.id, variants: { edges: [ { node: v } ] } },
-          { excludeLocationIdContains, raise }
-        );
-        for (const it of items) {
-          corrections.push(it);
-          if (maxCorrections && corrections.length >= maxCorrections) break;
-        }
+      const items = collectCorrectionsFromBulkInventoryItemNode(node, { excludeLocationIdContains, raise });
+      for (const it of items) {
+        corrections.push(it);
+        if (maxCorrections && corrections.length >= maxCorrections) break;
       }
-      if ((limitVariants && variantsSeen >= limitVariants) || (maxCorrections && corrections.length >= maxCorrections)) break;
+      if (maxCorrections && corrections.length >= maxCorrections) break;
     }
 
-    if (corrections.length === 0) return res.json({ ok:true, fixedCount: 0, message: 'Nada que corregir con los filtros/límites dados.' });
+    if (corrections.length === 0) {
+      return res.json({ ok:true, fixedCount: 0, message: 'Nada que corregir con los filtros/límites dados.' });
+    }
 
     const results = await applyBatches(corrections, 'correction');
     res.json({ ok:true, fixedCount: corrections.length, batches: results.length, sample: corrections.slice(0, 20) });
@@ -611,5 +585,6 @@ app.get('/bulk-fix', async (req, res) => {
     res.status(500).json({ ok:false, error: e.message });
   }
 });
+
 
 app.listen(PORT, () => console.log(`Listening on ${PORT}`));
