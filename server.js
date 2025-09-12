@@ -110,35 +110,24 @@ const LOCATIONS_QUERY = `
 `;
 
 // ------------- bulk minimal “Matrixify-like” -------------
-// Por defecto pedimos SOLO "available". Puedes pasar names=available,committed si quieres raise en ese slice.
-function buildBulkQuery({ search = null, names = ['available'] } = {}) {
+function buildBulkQueryOptimized({ search = null } = {}) {
+  // El filtro 'search' ahora aplica a inventoryLevels, no a productos.
+  // Ejemplo: 'updated_at:>=2025-09-01'
   const qArg = search ? `(query: ${JSON.stringify(search)})` : '';
-  const qtyList = names.map(n => JSON.stringify(n)).join(',');
   return `
   {
-    products${qArg} {
+    inventoryLevels${qArg} {
       edges {
         node {
-          id
-          variants(first: 250) {
-            edges {
-              node {
+          location { id }
+          available
+          item {
+            id
+            sku
+            variant {
+              id
+              product {
                 id
-                sku
-                inventoryItem {
-                  id
-                  inventoryLevels {
-                    edges {
-                      node {
-                        location { id }
-                        quantities(names: [${qtyList}]) {
-                          name
-                          quantity
-                        }
-                      }
-                    }
-                  }
-                }
               }
             }
           }
@@ -220,15 +209,13 @@ app.get('/locations-cache', async (_req, res) => {
 // ------------- BULK por slices -------------
 app.post('/bulk-start', async (req, res) => {
   try {
-    const q = req.query.q || null; // p.ej. vendor:"SILBON" / product_type:"Camisas" / title:A* / updated_at:>=2025-09-01
-    // por defecto SOLO available (lo más rápido y lo que Matrixify exporta):
-    const names = (req.query.names || 'available')
-      .split(',').map(s => s.trim()).filter(Boolean);
-    const query = buildBulkQuery({ search: q, names });
+    const q = req.query.q || null;
+    // La nueva query solo devuelve 'available', así que el parámetro 'names' ya no es necesario.
+    const query = buildBulkQueryOptimized({ search: q }); // <-- CAMBIO AQUÍ
     const data = await shopifyGraphQL(BULK_RUN, { query });
     const errs = data.bulkOperationRunQuery.userErrors || [];
     if (errs.length) return res.status(400).json({ ok: false, userErrors: errs });
-    res.json({ ok: true, started: data.bulkOperationRunQuery.bulkOperation, filter: q || null, names });
+    res.json({ ok: true, started: data.bulkOperationRunQuery.bulkOperation, filter: q || null });
   } catch (e) {
     res.status(500).json({ ok:false, error: e.message });
   }
@@ -284,43 +271,35 @@ app.get('/bulk-to-csv', async (_req, res) => {
     }
 
     const text = fs.readFileSync(BULK_FILE, 'utf8');
-    const locMap = await getLocationMap(); // id -> name
+    const locMap = await getLocationMap();
     const locIds = Array.from(locMap.keys());
     const locNames = locIds.map(id => locMap.get(id));
 
-    // Cabeceras
     const headers = ['ID', 'Variant ID', ...locNames.map(n => `Inventory Available: ${n}`)];
 
-    // Acumulamos por variante
-    // key: variantId, value: { productId, variantId, [locId]: available }
+    // Acumulamos por variante. La estructura es la misma que antes.
     const rows = new Map();
 
-    for (const obj of parseNdjsonLines(text)) {
-      // En este bulk: cada línea es product o edge.node->product con variants
-      const product = obj?.variants ? obj : obj?.node || obj;
-      if (!product?.variants) continue;
-      const productId = product.id;
+    for (const lvl of parseNdjsonLines(text)) {
+      // Cada línea ahora es un inventoryLevel
+      if (!lvl?.item?.variant?.id || !lvl?.location?.id) continue;
 
-      for (const ve of (product.variants.edges || [])) {
-        const v = ve?.node;
-        if (!v?.id || !v?.inventoryItem) continue;
-        const variantId = v.id;
+      const variantId = lvl.item.variant.id;
+      const productId = lvl.item.variant.product.id;
+      const locationId = lvl.location.id;
+      const available = lvl.available ?? 0;
 
-        if (!rows.has(variantId)) {
-          rows.set(variantId, { productId, variantId, levels: {} });
-        }
-        const rec = rows.get(variantId);
-
-        for (const le of (v.inventoryItem.inventoryLevels?.edges || [])) {
-          const lvl = le?.node; if (!lvl) continue;
-          const locId = lvl.location?.id;
-          const available = (lvl.quantities || []).find(q => q.name === 'available')?.quantity ?? 0;
-          rec.levels[locId] = available;
-        }
+      // Si es la primera vez que vemos esta variante, la inicializamos
+      if (!rows.has(variantId)) {
+        rows.set(variantId, { productId, variantId, levels: {} });
       }
+
+      // Añadimos el nivel de inventario para su ubicación
+      const rec = rows.get(variantId);
+      rec.levels[locationId] = available;
     }
 
-    // Construimos CSV
+    // Construimos el CSV (esta parte no cambia)
     let out = '';
     out += headers.join(',') + '\n';
     for (const [, rec] of rows) {
@@ -336,7 +315,7 @@ app.get('/bulk-to-csv', async (_req, res) => {
     }
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="inventory_available_slice.csv"');
+    res.setHeader('Content-Disposition', 'attachment; filename="inventory_available.csv"');
     res.send(out);
   } catch (e) {
     res.status(500).json({ ok:false, error: e.message });
