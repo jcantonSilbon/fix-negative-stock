@@ -110,32 +110,30 @@ const LOCATIONS_QUERY = `
 `;
 
 // ------------- bulk minimal “Matrixify-like” -------------
-function buildBulkQueryOptimized({ search = null } = {}) {
-  // Ojo: el query de inventoryItems solo admite filtros limitados (p.ej. sku:, updated_at:).
-  // Ejemplos válidos:
-  //   search = 'updated_at:>=2025-09-11'
-  //   search = 'sku:ABC*'
+// lite=true -> no pedir sku (menos bytes). search admite p.ej. updated_at:>=..., sku:A*, vendor:"SILBON"
+function buildBulkQueryOptimized({ search = null, lite = false } = {}) {
   const qArg = search ? `(query: ${JSON.stringify(search)})` : '';
-
+  // Pedimos SOLO lo imprescindible + product.status para clasificar
+  // NOTA: inventoryLevels usa quantities(names:["available"]) en 2024-04
   return `
   {
     inventoryItems${qArg} {
       edges {
         node {
           id
-          sku
+          ${lite ? '' : 'sku'}
           variant {
             id
-            product { id }
+            product {
+              id
+              status   # <- añadimos status para active/draft/archived
+            }
           }
           inventoryLevels {
             edges {
               node {
                 location { id }
-                quantities(names: ["available"]) {
-                  name
-                  quantity
-                }
+                quantities(names: ["available"]) { name quantity }
               }
             }
           }
@@ -160,20 +158,7 @@ async function getLocationMap() {
   return map;
 }
 
-// ------------- lógica de corrección (si quieres mantenerla) -------------
-function shouldFix(map, raise = false) {
-  const onHand    = map.on_hand ?? 0;
-  const available = map.available ?? 0;
-  const committed = map.committed ?? 0;
-  const incoming  = map.incoming  ?? 0;
-  if (onHand < 0) return true;
-  if (available < 0 && incoming === 0) {
-    if (!raise) return committed === 0;
-    return true;
-  }
-  return false;
-}
-
+// ------------- lógica de corrección -------------
 async function applyBatches(corrections, reason = 'correction') {
   const BATCH = 200;
   const results = [];
@@ -184,7 +169,7 @@ async function applyBatches(corrections, reason = 'correction') {
       setQuantities: batch.map(c => ({
         inventoryItemId: c.inventoryItemId,
         locationId: c.locationId,
-        quantity: (typeof c.setOnHandTo === 'number') ? c.setOnHandTo : 0
+        quantity: 0 // siempre a 0 para negativos
       }))
     };
     const resp = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
@@ -217,13 +202,13 @@ app.get('/locations-cache', async (_req, res) => {
 // ------------- BULK por slices -------------
 app.post('/bulk-start', async (req, res) => {
   try {
-    const q = req.query.q || null;
-    // La nueva query solo devuelve 'available', así que el parámetro 'names' ya no es necesario.
-    const query = buildBulkQueryOptimized({ search: q }); // <-- CAMBIO AQUÍ
+    const q = req.query.q || null;           // p.ej. updated_at:>=2025-09-11, sku:A*, vendor:"SILBON"
+    const lite = req.query.lite === '1';     // si quieres menos bytes
+    const query = buildBulkQueryOptimized({ search: q, lite });
     const data = await shopifyGraphQL(BULK_RUN, { query });
     const errs = data.bulkOperationRunQuery.userErrors || [];
     if (errs.length) return res.status(400).json({ ok: false, userErrors: errs });
-    res.json({ ok: true, started: data.bulkOperationRunQuery.bulkOperation, filter: q || null });
+    res.json({ ok: true, started: data.bulkOperationRunQuery.bulkOperation, filter: q || null, lite });
   } catch (e) {
     res.status(500).json({ ok:false, error: e.message });
   }
@@ -283,19 +268,15 @@ app.get('/bulk-to-csv', async (_req, res) => {
     const locIds = Array.from(locMap.keys());
     const locNames = locIds.map(id => locMap.get(id));
 
-    // Cabeceras estilo Matrixify
     const headers = ['ID', 'Variant ID', ...locNames.map(n => `Inventory Available: ${n}`)];
 
     // Índices temporales
-    // invIndex: inventoryItemId -> { variantId, productId }
-    const invIndex = new Map();
-    // variantRows: variantId -> { productId, variantId, levels:{[locId]: available} }
-    const variantRows = new Map();
+    const invIndex = new Map();     // inventoryItemId -> { variantId, productId }
+    const variantRows = new Map();  // variantId -> { productId, variantId, levels:{} }
 
-    // 1ª pasada: recoger inventoryItems (líneas sin __parentId y con "variant")
+    // 1ª pasada: inventoryItems
     for (const obj of parseNdjsonLines(text)) {
       if (!obj) continue;
-
       const isInventoryItem = obj.variant && !obj.__parentId;
       if (isInventoryItem) {
         const inventoryItemId = obj.id;
@@ -310,32 +291,27 @@ app.get('/bulk-to-csv', async (_req, res) => {
       }
     }
 
-    // 2ª pasada: recoger inventoryLevels (líneas HIJO con __parentId)
+    // 2ª pasada: inventoryLevels
     for (const obj of parseNdjsonLines(text)) {
       if (!obj) continue;
-
-      // Un nodo de nivel típico trae __parentId + location + quantities
       const parent = obj.__parentId;
-      const hasLevelShape = parent && obj.location && (Array.isArray(obj.quantities) || obj.quantities === null || obj.quantities === undefined);
-
+      const hasLevelShape = parent && obj.location && (Array.isArray(obj.quantities) || obj.quantities == null);
       if (!hasLevelShape) continue;
 
       const invMeta = invIndex.get(parent);
-      if (!invMeta) continue; // podría ser otro tipo de hijo que no nos interesa
+      if (!invMeta) continue;
 
       const locId = obj.location?.id;
       if (!locId) continue;
 
-      // Cantidad "available": en tu query viene como array de {name,quantity}
       const availableEntry = (obj.quantities || []).find(q => q.name === 'available');
       const available = availableEntry ? (availableEntry.quantity ?? 0) : 0;
 
-      const row = variantRows.get(invMeta.variantId) || { productId: invMeta.productId, variantId: invMeta.variantId, levels: {} };
+      const row = variantRows.get(invMeta.variantId);
       row.levels[locId] = available;
-      variantRows.set(invMeta.variantId, row);
     }
 
-    // Construcción CSV
+    // CSV
     let out = '';
     out += headers.join(',') + '\n';
     for (const [, rec] of variantRows) {
@@ -355,7 +331,100 @@ app.get('/bulk-to-csv', async (_req, res) => {
   }
 });
 
+// -------- Plan y Fix de negativos (rápido tras descargar NDJSON) --------
+app.get('/bulk-plan-negatives', async (_req, res) => {
+  try {
+    if (!fs.existsSync(BULK_FILE)) {
+      return res.status(400).json({ ok:false, error:'No hay NDJSON. Ejecuta /bulk-download antes.' });
+    }
+    const text = fs.readFileSync(BULK_FILE, 'utf8');
 
+    // index: invId -> meta
+    const invIndex = new Map();
+    for (const obj of parseNdjsonLines(text)) {
+      if (obj?.variant && !obj.__parentId) {
+        invIndex.set(obj.id, {
+          inventoryItemId: obj.id,
+          variantId: obj.variant?.id || null,
+          productId: obj.variant?.product?.id || null,
+          status: obj.variant?.product?.status || null,
+          sku: obj.sku || null
+        });
+      }
+    }
+
+    const negatives = [];
+    for (const obj of parseNdjsonLines(text)) {
+      if (!obj?.__parentId || !obj?.location) continue;
+      const meta = invIndex.get(obj.__parentId);
+      if (!meta) continue;
+
+      const available = (obj.quantities || []).find(q => q.name === 'available')?.quantity ?? 0;
+      if (available < 0) {
+        negatives.push({
+          ...meta,
+          locationId: obj.location.id,
+          available
+        });
+      }
+    }
+
+    const byStatus = negatives.reduce((acc, n) => {
+      const s = n.status || 'UNKNOWN';
+      acc[s] = (acc[s] || 0) + 1;
+      return acc;
+    }, {});
+
+    res.json({ ok:true, count: negatives.length, byStatus, sample: negatives.slice(0, 100) });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+app.post('/bulk-fix-negatives', async (req, res) => {
+  try {
+    if (!fs.existsSync(BULK_FILE)) {
+      return res.status(400).json({ ok:false, error:'No hay NDJSON. Ejecuta /bulk-download antes.' });
+    }
+    const text = fs.readFileSync(BULK_FILE, 'utf8');
+
+    // index inv -> meta
+    const invIndex = new Map();
+    for (const obj of parseNdjsonLines(text)) {
+      if (obj?.variant && !obj.__parentId) {
+        invIndex.set(obj.id, {
+          inventoryItemId: obj.id,
+          variantId: obj.variant?.id || null,
+          productId: obj.variant?.product?.id || null
+        });
+      }
+    }
+
+    const corrections = [];
+    for (const obj of parseNdjsonLines(text)) {
+      if (!obj?.__parentId || !obj?.location) continue;
+      const meta = invIndex.get(obj.__parentId);
+      if (!meta) continue;
+
+      const available = (obj.quantities || []).find(q => q.name === 'available')?.quantity ?? 0;
+      if (available < 0) {
+        corrections.push({
+          inventoryItemId: meta.inventoryItemId,
+          locationId: obj.location.id,
+          setOnHandTo: 0
+        });
+      }
+    }
+
+    if (!corrections.length) return res.json({ ok:true, message:'No hay negativos que corregir.' });
+
+    const reason = (req.query.reason || 'fix-negative-available').toString();
+    const results = await applyBatches(corrections, reason);
+    res.json({ ok:true, corrected: corrections.length, batches: results.length });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
 
 // ------------- variante puntual (diagnóstico rápido) -------------
 app.get('/variant-dry', async (req, res) => {
