@@ -279,45 +279,66 @@ app.get('/bulk-to-csv', async (_req, res) => {
     }
 
     const text = fs.readFileSync(BULK_FILE, 'utf8');
-    const locMap = await getLocationMap(); // id -> name
+    const locMap = await getLocationMap();           // id -> name
     const locIds = Array.from(locMap.keys());
     const locNames = locIds.map(id => locMap.get(id));
 
     // Cabeceras estilo Matrixify
     const headers = ['ID', 'Variant ID', ...locNames.map(n => `Inventory Available: ${n}`)];
 
-    // key: variantId → { productId, variantId, levels: { [locId]: available } }
-    const rows = new Map();
+    // Índices temporales
+    // invIndex: inventoryItemId -> { variantId, productId }
+    const invIndex = new Map();
+    // variantRows: variantId -> { productId, variantId, levels:{[locId]: available} }
+    const variantRows = new Map();
 
+    // 1ª pasada: recoger inventoryItems (líneas sin __parentId y con "variant")
     for (const obj of parseNdjsonLines(text)) {
-      // Cada línea de interés es un inventoryItem (o node dentro del edge)
-      const inv = obj?.inventoryLevels ? obj : obj?.node || obj;
-      if (!inv?.id || !inv?.inventoryLevels) continue;
+      if (!obj) continue;
 
-      const variantId = inv.variant?.id || null;
-      const productId = inv.variant?.product?.id || null;
-      if (!variantId) continue; // si no hay variant, saltamos (raro pero posible)
+      const isInventoryItem = obj.variant && !obj.__parentId;
+      if (isInventoryItem) {
+        const inventoryItemId = obj.id;
+        const variantId = obj.variant?.id || null;
+        const productId = obj.variant?.product?.id || null;
+        if (!inventoryItemId || !variantId) continue;
 
-      // Inicializa registro por variante
-      let rec = rows.get(variantId);
-      if (!rec) {
-        rec = { productId, variantId, levels: {} };
-        rows.set(variantId, rec);
+        invIndex.set(inventoryItemId, { variantId, productId });
+        if (!variantRows.has(variantId)) {
+          variantRows.set(variantId, { productId, variantId, levels: {} });
+        }
       }
+    }
 
-      // Carga "available" por location
-      for (const le of (inv.inventoryLevels.edges || [])) {
-        const lvl = le?.node; if (!lvl) continue;
-        const locId = lvl.location?.id;
-        const available = (lvl.quantities || []).find(q => q.name === 'available')?.quantity ?? 0;
-        rec.levels[locId] = available;
-      }
+    // 2ª pasada: recoger inventoryLevels (líneas HIJO con __parentId)
+    for (const obj of parseNdjsonLines(text)) {
+      if (!obj) continue;
+
+      // Un nodo de nivel típico trae __parentId + location + quantities
+      const parent = obj.__parentId;
+      const hasLevelShape = parent && obj.location && (Array.isArray(obj.quantities) || obj.quantities === null || obj.quantities === undefined);
+
+      if (!hasLevelShape) continue;
+
+      const invMeta = invIndex.get(parent);
+      if (!invMeta) continue; // podría ser otro tipo de hijo que no nos interesa
+
+      const locId = obj.location?.id;
+      if (!locId) continue;
+
+      // Cantidad "available": en tu query viene como array de {name,quantity}
+      const availableEntry = (obj.quantities || []).find(q => q.name === 'available');
+      const available = availableEntry ? (availableEntry.quantity ?? 0) : 0;
+
+      const row = variantRows.get(invMeta.variantId) || { productId: invMeta.productId, variantId: invMeta.variantId, levels: {} };
+      row.levels[locId] = available;
+      variantRows.set(invMeta.variantId, row);
     }
 
     // Construcción CSV
     let out = '';
     out += headers.join(',') + '\n';
-    for (const [, rec] of rows) {
+    for (const [, rec] of variantRows) {
       const line = [
         rec.productId || '',
         rec.variantId || '',
@@ -333,6 +354,7 @@ app.get('/bulk-to-csv', async (_req, res) => {
     res.status(500).json({ ok:false, error: e.message });
   }
 });
+
 
 
 // ------------- variante puntual (diagnóstico rápido) -------------
