@@ -111,23 +111,31 @@ const LOCATIONS_QUERY = `
 
 // ------------- bulk minimal “Matrixify-like” -------------
 function buildBulkQueryOptimized({ search = null } = {}) {
-  // El filtro 'search' ahora aplica a inventoryLevels, no a productos.
-  // Ejemplo: 'updated_at:>=2025-09-01'
+  // Ojo: el query de inventoryItems solo admite filtros limitados (p.ej. sku:, updated_at:).
+  // Ejemplos válidos:
+  //   search = 'updated_at:>=2025-09-11'
+  //   search = 'sku:ABC*'
   const qArg = search ? `(query: ${JSON.stringify(search)})` : '';
+
   return `
   {
-    inventoryLevels${qArg} {
+    inventoryItems${qArg} {
       edges {
         node {
-          location { id }
-          available
-          item {
+          id
+          sku
+          variant {
             id
-            sku
-            variant {
-              id
-              product {
-                id
+            product { id }
+          }
+          inventoryLevels {
+            edges {
+              node {
+                location { id }
+                quantities(names: ["available"]) {
+                  name
+                  quantity
+                }
               }
             }
           }
@@ -271,45 +279,49 @@ app.get('/bulk-to-csv', async (_req, res) => {
     }
 
     const text = fs.readFileSync(BULK_FILE, 'utf8');
-    const locMap = await getLocationMap();
+    const locMap = await getLocationMap(); // id -> name
     const locIds = Array.from(locMap.keys());
     const locNames = locIds.map(id => locMap.get(id));
 
+    // Cabeceras estilo Matrixify
     const headers = ['ID', 'Variant ID', ...locNames.map(n => `Inventory Available: ${n}`)];
 
-    // Acumulamos por variante. La estructura es la misma que antes.
+    // key: variantId → { productId, variantId, levels: { [locId]: available } }
     const rows = new Map();
 
-    for (const lvl of parseNdjsonLines(text)) {
-      // Cada línea ahora es un inventoryLevel
-      if (!lvl?.item?.variant?.id || !lvl?.location?.id) continue;
+    for (const obj of parseNdjsonLines(text)) {
+      // Cada línea de interés es un inventoryItem (o node dentro del edge)
+      const inv = obj?.inventoryLevels ? obj : obj?.node || obj;
+      if (!inv?.id || !inv?.inventoryLevels) continue;
 
-      const variantId = lvl.item.variant.id;
-      const productId = lvl.item.variant.product.id;
-      const locationId = lvl.location.id;
-      const available = lvl.available ?? 0;
+      const variantId = inv.variant?.id || null;
+      const productId = inv.variant?.product?.id || null;
+      if (!variantId) continue; // si no hay variant, saltamos (raro pero posible)
 
-      // Si es la primera vez que vemos esta variante, la inicializamos
-      if (!rows.has(variantId)) {
-        rows.set(variantId, { productId, variantId, levels: {} });
+      // Inicializa registro por variante
+      let rec = rows.get(variantId);
+      if (!rec) {
+        rec = { productId, variantId, levels: {} };
+        rows.set(variantId, rec);
       }
 
-      // Añadimos el nivel de inventario para su ubicación
-      const rec = rows.get(variantId);
-      rec.levels[locationId] = available;
+      // Carga "available" por location
+      for (const le of (inv.inventoryLevels.edges || [])) {
+        const lvl = le?.node; if (!lvl) continue;
+        const locId = lvl.location?.id;
+        const available = (lvl.quantities || []).find(q => q.name === 'available')?.quantity ?? 0;
+        rec.levels[locId] = available;
+      }
     }
 
-    // Construimos el CSV (esta parte no cambia)
+    // Construcción CSV
     let out = '';
     out += headers.join(',') + '\n';
     for (const [, rec] of rows) {
       const line = [
-        rec.productId,
-        rec.variantId,
-        ...locIds.map(id => {
-          const v = rec.levels[id];
-          return (v == null ? '' : String(v));
-        })
+        rec.productId || '',
+        rec.variantId || '',
+        ...locIds.map(id => (rec.levels[id] == null ? '' : String(rec.levels[id])))
       ];
       out += line.join(',') + '\n';
     }
@@ -321,6 +333,7 @@ app.get('/bulk-to-csv', async (_req, res) => {
     res.status(500).json({ ok:false, error: e.message });
   }
 });
+
 
 // ------------- variante puntual (diagnóstico rápido) -------------
 app.get('/variant-dry', async (req, res) => {
