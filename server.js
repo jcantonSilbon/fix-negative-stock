@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 8080;
 
 const SHOP  = process.env.SHOPIFY_SHOP;
 const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
-const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
+const API_VERSION = process.env.SHOPIFY_API_VERSION || '2024-04';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
