@@ -8,15 +8,15 @@ import { fileURLToPath } from 'url';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-const SHOP  = process.env.SHOPIFY_SHOP;
-const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const SHOP  = process.env.SHOPIFY_SHOP;                 // p.ej. silbon-store.myshopify.com
+const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;          // shpat_****
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2024-04';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 const BULK_FILE  = path.join('/tmp', 'shopify-bulk.ndjson');
 
-// ------------- helpers básicos -------------
+// ------------- helpers -------------
 function toGidVariant(idOrGid) {
   const s = String(idOrGid || '');
   return s.startsWith('gid://') ? s : `gid://shopify/ProductVariant/${s}`;
@@ -57,10 +57,7 @@ const VARIANT_WITH_LEVELS = `
           edges {
             node {
               location { id }
-              quantities(names: ["available"]) {
-                name
-                quantity
-              }
+              quantities(names: ["available"]) { name quantity }
             }
           }
         }
@@ -110,11 +107,10 @@ const LOCATIONS_QUERY = `
 `;
 
 // ------------- bulk minimal “Matrixify-like” -------------
-// lite=true -> no pedir sku (menos bytes). search admite p.ej. updated_at:>=..., sku:A*, vendor:"SILBON"
+// lite=1 → no pedir sku para reducir bytes.
+// search admite: updated_at:>=YYYY-MM-DD, sku:A*, vendor:"ACME", etc.
 function buildBulkQueryOptimized({ search = null, lite = false } = {}) {
   const qArg = search ? `(query: ${JSON.stringify(search)})` : '';
-  // Pedimos SOLO lo imprescindible + product.status para clasificar
-  // NOTA: inventoryLevels usa quantities(names:["available"]) en 2024-04
   return `
   {
     inventoryItems${qArg} {
@@ -124,10 +120,7 @@ function buildBulkQueryOptimized({ search = null, lite = false } = {}) {
           ${lite ? '' : 'sku'}
           variant {
             id
-            product {
-              id
-              status   # <- añadimos status para active/draft/archived
-            }
+            product { id status }
           }
           inventoryLevels {
             edges {
@@ -143,7 +136,7 @@ function buildBulkQueryOptimized({ search = null, lite = false } = {}) {
   }`;
 }
 
-// ------------- cache de locations -------------
+// ------------- cache de locations (para cabeceras CSV) -------------
 let _locCache = { map: new Map(), at: 0 };
 async function getLocationMap() {
   const now = Date.now();
@@ -158,8 +151,8 @@ async function getLocationMap() {
   return map;
 }
 
-// ------------- lógica de corrección -------------
-async function applyBatches(corrections, reason = 'correction') {
+// ------------- aplicar correcciones -------------
+async function applyBatches(corrections, reason = 'fix-negative-available') {
   const BATCH = 200;
   const results = [];
   for (let i = 0; i < corrections.length; i += BATCH) {
@@ -181,7 +174,6 @@ async function applyBatches(corrections, reason = 'correction') {
 
 // ------------- routes básicas -------------
 app.get('/health', (_, res) => res.send('OK'));
-
 app.get('/env-check', (_, res) => {
   res.json({
     SHOPIFY_SHOP: process.env.SHOPIFY_SHOP || null,
@@ -190,20 +182,11 @@ app.get('/env-check', (_, res) => {
   });
 });
 
-app.get('/locations-cache', async (_req, res) => {
-  try {
-    const map = await getLocationMap();
-    res.json({ ok: true, count: map.size, items: Array.from(map.entries()) });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: e.message });
-  }
-});
-
-// ------------- BULK por slices -------------
+// ------------- BULK control -------------
 app.post('/bulk-start', async (req, res) => {
   try {
-    const q = req.query.q || null;           // p.ej. updated_at:>=2025-09-11, sku:A*, vendor:"SILBON"
-    const lite = req.query.lite === '1';     // si quieres menos bytes
+    const q = req.query.q || null;       // e.g. updated_at:>=2025-09-11, sku:A*, vendor:"SILBON"
+    const lite = req.query.lite === '1'; // menos bytes
     const query = buildBulkQueryOptimized({ search: q, lite });
     const data = await shopifyGraphQL(BULK_RUN, { query });
     const errs = data.bulkOperationRunQuery.userErrors || [];
@@ -256,22 +239,115 @@ app.get('/bulk-download', async (_req, res) => {
   }
 });
 
-// ------------- CSV estilo Matrixify -------------
+// ------------- PLAN: detectar negativos en NDJSON -------------
+app.get('/bulk-plan-negatives', async (_req, res) => {
+  try {
+    if (!fs.existsSync(BULK_FILE)) {
+      return res.status(400).json({ ok:false, error:'No hay NDJSON. Ejecuta /bulk-download antes.' });
+    }
+    const text = fs.readFileSync(BULK_FILE, 'utf8');
+
+    // index inv → meta
+    const invIndex = new Map();
+    for (const obj of parseNdjsonLines(text)) {
+      if (obj?.variant && !obj.__parentId) {
+        invIndex.set(obj.id, {
+          inventoryItemId: obj.id,
+          variantId: obj.variant?.id || null,
+          productId: obj.variant?.product?.id || null,
+          status: obj.variant?.product?.status || null,
+          sku: obj.sku || null
+        });
+      }
+    }
+
+    const negatives = [];
+    for (const obj of parseNdjsonLines(text)) {
+      if (!obj?.__parentId || !obj?.location) continue;
+      const meta = invIndex.get(obj.__parentId);
+      if (!meta) continue;
+
+      const available = (obj.quantities || []).find(q => q.name === 'available')?.quantity ?? 0;
+      if (available < 0) {
+        negatives.push({
+          ...meta,
+          locationId: obj.location.id,
+          available
+        });
+      }
+    }
+
+    const byStatus = negatives.reduce((acc, n) => {
+      const s = n.status || 'UNKNOWN';
+      acc[s] = (acc[s] || 0) + 1;
+      return acc;
+    }, {});
+
+    res.json({ ok:true, count: negatives.length, byStatus, sample: negatives.slice(0, 100) });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// ------------- FIX: poner negativos a 0 -------------
+app.post('/bulk-fix-negatives', async (req, res) => {
+  try {
+    if (!fs.existsSync(BULK_FILE)) {
+      return res.status(400).json({ ok:false, error:'No hay NDJSON. Ejecuta /bulk-download antes.' });
+    }
+    const text = fs.readFileSync(BULK_FILE, 'utf8');
+
+    // index inv → meta
+    const invIndex = new Map();
+    for (const obj of parseNdjsonLines(text)) {
+      if (obj?.variant && !obj.__parentId) {
+        invIndex.set(obj.id, {
+          inventoryItemId: obj.id,
+          variantId: obj.variant?.id || null,
+          productId: obj.variant?.product?.id || null
+        });
+      }
+    }
+
+    const corrections = [];
+    for (const obj of parseNdjsonLines(text)) {
+      if (!obj?.__parentId || !obj?.location) continue;
+      const meta = invIndex.get(obj.__parentId);
+      if (!meta) continue;
+
+      const available = (obj.quantities || []).find(q => q.name === 'available')?.quantity ?? 0;
+      if (available < 0) {
+        corrections.push({
+          inventoryItemId: meta.inventoryItemId,
+          locationId: obj.location.id,
+          setOnHandTo: 0
+        });
+      }
+    }
+
+    if (!corrections.length) return res.json({ ok:true, message:'No hay negativos que corregir.' });
+
+    const reason = (req.query.reason || 'fix-negative-available').toString();
+    const results = await applyBatches(corrections, reason);
+    res.json({ ok:true, corrected: corrections.length, batches: results.length });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// ------------- CSV estilo Matrixify (opcional) -------------
 app.get('/bulk-to-csv', async (_req, res) => {
   try {
     if (!fs.existsSync(BULK_FILE)) {
       return res.status(400).json({ ok:false, error:'No hay archivo NDJSON. Ejecuta /bulk-download antes.' });
     }
-
     const text = fs.readFileSync(BULK_FILE, 'utf8');
-    const locMap = await getLocationMap();           // id -> name
+    const locMap = await getLocationMap();
     const locIds = Array.from(locMap.keys());
     const locNames = locIds.map(id => locMap.get(id));
-
     const headers = ['ID', 'Variant ID', ...locNames.map(n => `Inventory Available: ${n}`)];
 
-    // Índices temporales
-    const invIndex = new Map();     // inventoryItemId -> { variantId, productId }
+    const invIndex = new Map();     // invId -> { variantId, productId }
     const variantRows = new Map();  // variantId -> { productId, variantId, levels:{} }
 
     // 1ª pasada: inventoryItems
@@ -328,101 +404,6 @@ app.get('/bulk-to-csv', async (_req, res) => {
     res.send(out);
   } catch (e) {
     res.status(500).json({ ok:false, error: e.message });
-  }
-});
-
-// -------- Plan y Fix de negativos (rápido tras descargar NDJSON) --------
-app.get('/bulk-plan-negatives', async (_req, res) => {
-  try {
-    if (!fs.existsSync(BULK_FILE)) {
-      return res.status(400).json({ ok:false, error:'No hay NDJSON. Ejecuta /bulk-download antes.' });
-    }
-    const text = fs.readFileSync(BULK_FILE, 'utf8');
-
-    // index: invId -> meta
-    const invIndex = new Map();
-    for (const obj of parseNdjsonLines(text)) {
-      if (obj?.variant && !obj.__parentId) {
-        invIndex.set(obj.id, {
-          inventoryItemId: obj.id,
-          variantId: obj.variant?.id || null,
-          productId: obj.variant?.product?.id || null,
-          status: obj.variant?.product?.status || null,
-          sku: obj.sku || null
-        });
-      }
-    }
-
-    const negatives = [];
-    for (const obj of parseNdjsonLines(text)) {
-      if (!obj?.__parentId || !obj?.location) continue;
-      const meta = invIndex.get(obj.__parentId);
-      if (!meta) continue;
-
-      const available = (obj.quantities || []).find(q => q.name === 'available')?.quantity ?? 0;
-      if (available < 0) {
-        negatives.push({
-          ...meta,
-          locationId: obj.location.id,
-          available
-        });
-      }
-    }
-
-    const byStatus = negatives.reduce((acc, n) => {
-      const s = n.status || 'UNKNOWN';
-      acc[s] = (acc[s] || 0) + 1;
-      return acc;
-    }, {});
-
-    res.json({ ok:true, count: negatives.length, byStatus, sample: negatives.slice(0, 100) });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:e.message });
-  }
-});
-
-app.post('/bulk-fix-negatives', async (req, res) => {
-  try {
-    if (!fs.existsSync(BULK_FILE)) {
-      return res.status(400).json({ ok:false, error:'No hay NDJSON. Ejecuta /bulk-download antes.' });
-    }
-    const text = fs.readFileSync(BULK_FILE, 'utf8');
-
-    // index inv -> meta
-    const invIndex = new Map();
-    for (const obj of parseNdjsonLines(text)) {
-      if (obj?.variant && !obj.__parentId) {
-        invIndex.set(obj.id, {
-          inventoryItemId: obj.id,
-          variantId: obj.variant?.id || null,
-          productId: obj.variant?.product?.id || null
-        });
-      }
-    }
-
-    const corrections = [];
-    for (const obj of parseNdjsonLines(text)) {
-      if (!obj?.__parentId || !obj?.location) continue;
-      const meta = invIndex.get(obj.__parentId);
-      if (!meta) continue;
-
-      const available = (obj.quantities || []).find(q => q.name === 'available')?.quantity ?? 0;
-      if (available < 0) {
-        corrections.push({
-          inventoryItemId: meta.inventoryItemId,
-          locationId: obj.location.id,
-          setOnHandTo: 0
-        });
-      }
-    }
-
-    if (!corrections.length) return res.json({ ok:true, message:'No hay negativos que corregir.' });
-
-    const reason = (req.query.reason || 'fix-negative-available').toString();
-    const results = await applyBatches(corrections, reason);
-    res.json({ ok:true, corrected: corrections.length, batches: results.length });
-  } catch (e) {
-    res.status(500).json({ ok:false, error:e.message });
   }
 });
 
