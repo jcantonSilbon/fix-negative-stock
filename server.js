@@ -22,8 +22,7 @@ app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
 });
-
-function log(...args){ if (DEBUG) console.log(...args); }
+const log = (...args) => { if (DEBUG) console.log(...args); };
 
 if (!SHOP || !TOKEN || !WEBHOOK_SECRET) {
   console.warn('⚠️  Faltan envs: SHOPIFY_SHOP / SHOPIFY_ADMIN_TOKEN / SHOPIFY_WEBHOOK_SECRET');
@@ -52,49 +51,35 @@ async function shopifyGraphQL(query, variables = {}) {
   return json.data;
 }
 
-// Devuelve { ok:boolean, mode:'ascii'|'hex'|'base64'|null, digests:{ascii,hex,base64} }
-function verifyHmacAll(rawBody, signatureB64) {
-  if (!WEBHOOK_SECRET || !signatureB64) return { ok:false, mode:null, digests:{} };
-
-  const headerBuf = Buffer.from(signatureB64, 'base64');
-
-  // 1) clave como ASCII
-  const d_ascii_b64 = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('base64');
-  const a_ok = safeEq(Buffer.from(d_ascii_b64, 'base64'), headerBuf);
-
-  // 2) clave como HEX (si encaja patrón de hex y longitud par)
-  let h_ok = false, d_hex_b64 = null;
-  if (/^[0-9a-fA-F]+$/.test(WEBHOOK_SECRET) && WEBHOOK_SECRET.length % 2 === 0) {
-    const keyHex = Buffer.from(WEBHOOK_SECRET, 'hex');
-    d_hex_b64 = crypto.createHmac('sha256', keyHex).update(rawBody).digest('base64');
-    h_ok = safeEq(Buffer.from(d_hex_b64, 'base64'), headerBuf);
-  }
-
-  // 3) clave como BASE64 (si parece b64)
-  let b_ok = false, d_b64_b64 = null;
-  if (/^[A-Za-z0-9+/=]+$/.test(WEBHOOK_SECRET) && WEBHOOK_SECRET.includes('=')) {
-    try {
-      const keyB64 = Buffer.from(WEBHOOK_SECRET, 'base64');
-      d_b64_b64 = crypto.createHmac('sha256', keyB64).update(rawBody).digest('base64');
-      b_ok = safeEq(Buffer.from(d_b64_b64, 'base64'), headerBuf);
-    } catch {}
-  }
-
-  const mode = a_ok ? 'ascii' : h_ok ? 'hex' : b_ok ? 'base64' : null;
-  if (DEBUG) {
-    console.log('➡️  HMAC signature (shopify):     ', signatureB64);
-    if (d_ascii_b64) console.log('➡️  digest ascii (server):       ', d_ascii_b64, 'match?', a_ok);
-    if (d_hex_b64)   console.log('➡️  digest hex   (server):       ', d_hex_b64,   'match?', h_ok);
-    if (d_b64_b64)   console.log('➡️  digest base64(server):       ', d_b64_b64,   'match?', b_ok);
-    console.log('➡️  MATCH MODE:', mode);
-  }
-  return { ok: !!mode, mode, digests: { ascii:d_ascii_b64, hex:d_hex_b64, base64:d_b64_b64 } };
-}
-
+// ───────── HMAC (simple y fiable) ─────────
 function safeEq(a, b) {
   if (!a || !b) return false;
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+// Prioriza ASCII (tal cual lo muestra Shopify). Si el secreto es HEX de 64 chars, también lo probamos.
+function verifyHmac(rawBody, signatureB64) {
+  if (!WEBHOOK_SECRET || !signatureB64) return false;
+
+  const header = Buffer.from(signatureB64, 'base64');
+
+  // 1) clave ASCII
+  const calcAsciiB64 = crypto.createHmac('sha256', WEBHOOK_SECRET)
+    .update(rawBody)
+    .digest('base64');
+  if (safeEq(Buffer.from(calcAsciiB64, 'base64'), header)) return true;
+
+  // 2) clave HEX (64 chars)
+  if (/^[0-9a-fA-F]{64}$/.test(WEBHOOK_SECRET)) {
+    const keyHex = Buffer.from(WEBHOOK_SECRET, 'hex');
+    const calcHexB64 = crypto.createHmac('sha256', keyHex)
+      .update(rawBody)
+      .digest('base64');
+    if (safeEq(Buffer.from(calcHexB64, 'base64'), header)) return true;
+  }
+
+  return false;
 }
 
 // ───────── GQL mutation ─────────
@@ -125,18 +110,13 @@ app.get('/env-check', (_req, res) => {
   });
 });
 
-// eco crudo para verificar (sin HMAC)
+// eco crudo para verificar (opcional)
 app.post('/_echo_raw', express.raw({ type: '*/*', limit: '2mb' }), (req, res) => {
-  const raw = toBuf(req.body);
-  console.log('ECHO RAW headers:', req.headers);
-  console.log('ECHO RAW body:', raw.toString('utf8'));
+  const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+  log('ECHO RAW headers:', req.headers);
+  log('ECHO RAW body:', raw.toString('utf8'));
   res.json({ ok: true, len: raw.length });
 });
-
-let lastPayload = null;
-app.get('/_last', (_req, res) => res.json(lastPayload ?? { note: 'no payload yet' }));
-
-function toBuf(body){ return Buffer.isBuffer(body) ? body : Buffer.from(body || ''); }
 
 // ───────── lógica común ─────────
 async function handleInventoryPayload(payload) {
@@ -144,17 +124,18 @@ async function handleInventoryPayload(payload) {
   const locId  = payload.location_id;
   const avail  = Number(payload.available ?? 0);
 
-  if (!itemId || !locId) {
-    return { ok: true, ignored: 'faltan ids o body vacío' };
-  }
+  if (!itemId || !locId) return { ok: true, ignored: 'faltan ids o body vacío' };
 
+  // dedupe por (item, loc, available)
   gcSeen();
   const key = seenKey(itemId, locId, avail);
   if (seen.has(key)) return { ok: true, deduped: true };
   seen.set(key, Date.now());
 
+  // si no es negativo, nada que hacer
   if (avail >= 0) return { ok: true, negative: false, available: avail };
 
+  // NEGATIVO → fijar a 0
   const input = {
     reason: 'correction',
     setQuantities: [{
@@ -167,50 +148,46 @@ async function handleInventoryPayload(payload) {
   const data = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
   const errs = data.inventorySetOnHandQuantities.userErrors || [];
   if (errs.length) {
-    console.error('userErrors', errs);
+    console.error('❌ FIX ERROR', { itemId, locId, before: avail, errs });
     return { ok: false, userErrors: errs };
   }
 
-  return { ok: true, fixed: true, inventory_item_id: itemId, location_id: locId, set_on_hand_to: 0 };
+  // log visible siempre cuando corrige
+  console.log(`⚡ FIXED NEGATIVE → item ${itemId} @ loc ${locId}: ${avail} → 0`);
+
+  return {
+    ok: true,
+    fixed: true,
+    inventory_item_id: itemId,
+    location_id: locId,
+    before_available: avail,
+    set_on_hand_to: 0
+  };
 }
 
-// ───────── webhook real (RAW + HMAC + logs) ─────────
+// ───────── webhook (RAW + HMAC) ─────────
 app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
   try {
-    const raw  = toBuf(req.body);
-    const sig  = (req.get('X-Shopify-Hmac-Sha256') || '').trim();
-    const topic = req.get('X-Shopify-Topic');
-    const shop  = req.get('X-Shopify-Shop-Domain');
+    const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+    const sig = (req.get('X-Shopify-Hmac-Sha256') || '').trim();
 
-    log('➡️  Webhook headers:', { topic, shop, sigLen: sig.length, contentType: req.get('content-type') });
-    log('➡️  Raw length:', raw.length);
-
-    const { ok, mode } = verifyHmacAll(raw, sig);
-    if (!ok && !BYPASS) {
+    if (!verifyHmac(raw, sig) && !BYPASS) {
       console.warn('❌ Bad HMAC (rechazado).');
       return res.status(401).send('Bad HMAC');
     }
-    console.log(ok ? `✅ HMAC verificado (modo ${mode}).` : '⚠️ BYPASS_HMAC activo: aceptando sin verificar.');
+    if (DEBUG) console.log(BYPASS ? '⚠️ BYPASS_HMAC activo' : '✅ HMAC OK');
 
     // payload tolerante
     let payload = {};
     try {
       const txt = raw.toString('utf8').trim();
       payload = txt ? (JSON.parse(txt) ?? {}) : {};
-    } catch (e) {
-      console.warn('⚠️  JSON parse error, usando {}:', e.message);
-      payload = {};
-    }
-
-    lastPayload = { at: new Date().toISOString(), headers: req.headers, payload };
-
-    log('📦 Payload parseado:', payload);
+    } catch { payload = {}; }
 
     const result = await handleInventoryPayload(payload);
-    log('🛠️  Resultado:', result);
-
     res.status(200).json(result);
   } catch (e) {
+    // 200 para no provocar bucles si el fallo es nuestro
     console.error('webhook error', e);
     res.status(200).json({ ok: false, error: e.message });
   }
