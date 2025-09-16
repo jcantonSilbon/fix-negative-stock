@@ -1,4 +1,3 @@
-// server.js
 import express from 'express';
 import crypto from 'crypto';
 import fetch from 'node-fetch';
@@ -6,21 +5,18 @@ import fetch from 'node-fetch';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-const SHOP  = process.env.SHOPIFY_SHOP;                // p.ej. silbon-store.myshopify.com
-const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;         // shpat_***
+const SHOP  = process.env.SHOPIFY_SHOP;
+const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-04';
-const WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET; // <- OBLIGATORIO
+const WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 
 if (!SHOP || !TOKEN || !WEBHOOK_SECRET) {
   console.warn('Faltan envs: SHOPIFY_SHOP / SHOPIFY_ADMIN_TOKEN / SHOPIFY_WEBHOOK_SECRET');
 }
 
-// ---- body parser guardando RAW para HMAC (no cambiar el resto) ----
-app.use(express.json({
-  verify: (req, _res, buf) => { req.rawBody = buf; }
-}));
+// ⛔️ QUITADO el express.json() global
+// ⚠️ Para pruebas locales, lo metemos solo bajo /_test más abajo.
 
-// ---- helpers ----
 function gid(type, id) {
   const s = String(id || '').trim();
   return s.startsWith('gid://') ? s : `gid://shopify/${type}/${s}`;
@@ -38,22 +34,16 @@ async function shopifyGraphQL(query, variables = {}) {
   return json.data;
 }
 
-function verifyHmac(req) {
+function verifyHmac(rawBody, req) {
   const signature = req.get('X-Shopify-Hmac-Sha256') || '';
-  if (!signature || !WEBHOOK_SECRET || !req.rawBody) return false;
-
-  const digest = crypto
-    .createHmac('sha256', WEBHOOK_SECRET)
-    .update(req.rawBody)
-    .digest('base64');
-
+  if (!signature || !WEBHOOK_SECRET) return false;
+  const digest = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('base64');
   const a = Buffer.from(digest, 'utf8');
   const b = Buffer.from(signature, 'utf8');
-  if (a.length !== b.length) return false; // evita throw
+  if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
 
-// ---- mutation para ajustar on_hand ----
 const INVENTORY_SET_ON_HAND = `
   mutation SetOnHand($input: InventorySetOnHandQuantitiesInput!) {
     inventorySetOnHandQuantities(input: $input) {
@@ -63,16 +53,11 @@ const INVENTORY_SET_ON_HAND = `
   }
 `;
 
-// Cache anti-duplicados (Shopify puede reintentar)
-const seen = new Map(); // key -> ts
+const seen = new Map();
 const SEEN_TTL_MS = 5 * 60 * 1000;
 const seenKey = (itemId, locId, available) => `${itemId}|${locId}|${available}`;
-function gcSeen() {
-  const now = Date.now();
-  for (const [k, ts] of seen.entries()) if (now - ts > SEEN_TTL_MS) seen.delete(k);
-}
+function gcSeen(){ const now=Date.now(); for (const [k,ts] of seen) if (now-ts>SEEN_TTL_MS) seen.delete(k); }
 
-// ---- endpoints mínimos ----
 app.get('/health', (_req, res) => res.send('OK'));
 app.get('/env-check', (_req, res) => {
   res.json({
@@ -83,28 +68,32 @@ app.get('/env-check', (_req, res) => {
   });
 });
 
-// Webhook: INVENTORY_LEVELS_UPDATE (topic: inventory_levels/update)
-app.post('/webhooks/inventory_levels/update', async (req, res) => {
+// ✅ Webhook: usar cuerpo RAW
+app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*' }), async (req, res) => {
   try {
-    if (!verifyHmac(req)) return res.status(401).send('Bad HMAC');
+    const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+    if (!verifyHmac(raw, req)) return res.status(401).send('Bad HMAC');
 
-    const payload = req.body || {};
-    // Ej: { inventory_item_id, location_id, available, updated_at }
+    // Tolerante a "null" o vacío
+    let payload = {};
+    try {
+      const txt = raw.toString('utf8').trim();
+      payload = txt ? JSON.parse(txt) ?? {} : {};
+    } catch { payload = {}; }
+
     const itemId = payload.inventory_item_id;
     const locId  = payload.location_id;
     const avail  = Number(payload.available ?? 0);
 
     if (!itemId || !locId) {
-      return res.status(200).json({ ok: true, ignored: 'faltan ids' });
+      return res.status(200).json({ ok: true, ignored: 'faltan ids o body vacío' });
     }
 
-    // dedupe
     gcSeen();
     const key = seenKey(itemId, locId, avail);
     if (seen.has(key)) return res.status(200).json({ ok: true, deduped: true });
     seen.set(key, Date.now());
 
-    // sólo actuamos si es negativo
     if (avail >= 0) return res.status(200).json({ ok: true, negative: false, available: avail });
 
     const input = {
@@ -123,24 +112,24 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       return res.status(200).json({ ok: false, userErrors: errs });
     }
 
-    return res.status(200).json({
-      ok: true,
-      fixed: true,
-      inventory_item_id: itemId,
-      location_id: locId,
-      set_on_hand_to: 0
-    });
+    res.status(200).json({ ok: true, fixed: true, inventory_item_id: itemId, location_id: locId, set_on_hand_to: 0 });
   } catch (e) {
     console.error('webhook error', e);
-    return res.status(200).json({ ok: false, error: e.message });
+    res.status(200).json({ ok: false, error: e.message });
   }
 });
 
-// (opcional) prueba local del flujo sin HMAC
+// 🧪 Test manual (solo aquí usamos JSON parser)
 app.post('/_test/inventory_levels/update', express.json(), async (req, res) => {
-  req.rawBody = Buffer.from(JSON.stringify(req.body || {}));
-  req.get = () => ''; // sin firma
-  return app._router.handle(req, res, () => {});
+  // Reutiliza la misma lógica del webhook pero sin HMAC
+  const raw = Buffer.from(JSON.stringify(req.body || {}));
+  req.get = () => '';
+  req.body = raw;
+  return app._router.handle(
+    new Proxy(req, { get: (t, p) => (p === 'body' ? raw : t[p]) }),
+    res,
+    () => {}
+  );
 });
 
 app.listen(PORT, () => console.log(`Listening on ${PORT}`));
