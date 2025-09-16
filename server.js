@@ -47,6 +47,8 @@ function verifyHmac(rawBody, req) {
   const signature = req.get('X-Shopify-Hmac-Sha256') || '';
   if (!signature || !WEBHOOK_SECRET) return false;
   const digestB64 = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('base64');
+  console.log('digestB64:', digestB64);
+  console.log('match :', digestB64 === SIG);
   const a = Buffer.from(digestB64, 'base64');
   const b = Buffer.from(signature,  'base64');
   if (a.length !== b.length) return false;
