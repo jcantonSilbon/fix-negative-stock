@@ -10,7 +10,7 @@ const SHOP  = process.env.SHOPIFY_SHOP;
 const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2024-04';
 
-// lee el secreto (admite el typo SEGRET) y trímalo
+// admite el typo SEGRET, y trimea
 const RAW_SECRET = (process.env.SHOPIFY_WEBHOOK_SECRET ?? process.env.SHOPIFY_WEBHOOK_SEGRET ?? '').trim();
 const WEBHOOK_SECRET = RAW_SECRET || null;
 
@@ -18,22 +18,21 @@ if (!SHOP || !TOKEN || !WEBHOOK_SECRET) {
   console.warn('Faltan envs: SHOPIFY_SHOP / SHOPIFY_ADMIN_TOKEN / SHOPIFY_WEBHOOK_SECRET');
 }
 
-// ───────────────── logger mínimo ─────────────────
+// ───────── logger ─────────
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
 });
 
 const DEBUG = process.env.DEBUG_WEBHOOKS === '1';
-function log(...args){ if (DEBUG) console.log(...args); }
+const log = (...a) => { if (DEBUG) console.log(...a); };
 
-// log de diagnóstico del secreto (solo si DEBUG=1)
 if (DEBUG) {
-  const prev = WEBHOOK_SECRET ? WEBHOOK_SECRET.slice(0, 6) + '...' + WEBHOOK_SECRET.slice(-4) : null;
+  const prev = WEBHOOK_SECRET ? WEBHOOK_SECRET.slice(0,6)+'...'+WEBHOOK_SECRET.slice(-4) : null;
   console.log('🔐 Secret loaded?', !!WEBHOOK_SECRET, 'len=', WEBHOOK_SECRET?.length, 'preview=', prev);
 }
 
-// ───────────────── helpers ─────────────────
+// ───────── helpers ─────────
 function gid(type, id) {
   const s = String(id || '').trim();
   return s.startsWith('gid://') ? s : `gid://shopify/${type}/${s}`;
@@ -51,28 +50,43 @@ async function shopifyGraphQL(query, variables = {}) {
   return json.data;
 }
 
+// HMAC con “doble intento”: ASCII y HEX (si la clave parece HEX de 64 chars)
 function verifyHmac(rawBody, req) {
   const signature = (req.get('X-Shopify-Hmac-Sha256') || '').trim();
   if (!signature || !WEBHOOK_SECRET) return false;
 
-  // HMAC SHA256 del cuerpo crudo con la clave EXACTA tal cual aparece en Shopify
-  const digestB64 = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('base64');
+  const looksHex = /^[0-9a-f]{64}$/i.test(WEBHOOK_SECRET);
 
-  // compara como bytes
-  const a = Buffer.from(digestB64, 'base64');
-  const b = Buffer.from(signature,  'base64');
-  if (a.length !== b.length) return false;
+  // 1) usa la clave como texto
+  const digestAscii = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('base64');
 
-  const ok = crypto.timingSafeEqual(a, b);
-  if (DEBUG) {
-    console.log('➡️  HMAC digest (server, base64):', digestB64);
-    console.log('➡️  HMAC signature (shopify):    ', signature);
-    console.log('➡️  HMAC match?:', ok);
+  // 2) si parece hex, prueba también como bytes
+  let digestHex = null;
+  if (looksHex) {
+    const keyBytes = Buffer.from(WEBHOOK_SECRET, 'hex');
+    digestHex = crypto.createHmac('sha256', keyBytes).update(rawBody).digest('base64');
   }
-  return ok;
+
+  const sigBytes = Buffer.from(signature, 'base64');
+  const aBytes   = Buffer.from(digestAscii, 'base64');
+  const hOkAscii = (aBytes.length === sigBytes.length) && crypto.timingSafeEqual(aBytes, sigBytes);
+
+  let hOkHex = false;
+  if (digestHex) {
+    const hBytes = Buffer.from(digestHex, 'base64');
+    hOkHex = (hBytes.length === sigBytes.length) && crypto.timingSafeEqual(hBytes, sigBytes);
+  }
+
+  if (DEBUG) {
+    console.log('➡️  HMAC signature (shopify):    ', signature);
+    console.log('➡️  digest ASCII (server):       ', digestAscii, 'match?', hOkAscii);
+    if (digestHex) console.log('➡️  digest HEXKEY (server):      ', digestHex,   'match?', hOkHex);
+  }
+
+  return hOkAscii || hOkHex;
 }
 
-// ───────────────── GQL mutation ─────────────────
+// ───────── GQL mutation ─────────
 const INVENTORY_SET_ON_HAND = `
   mutation SetOnHand($input: InventorySetOnHandQuantitiesInput!) {
     inventorySetOnHandQuantities(input: $input) {
@@ -82,13 +96,13 @@ const INVENTORY_SET_ON_HAND = `
   }
 `;
 
-// dedupe simple: Shopify reintenta webhooks
+// dedupe simple (Shopify reintenta webhooks)
 const seen = new Map();
 const SEEN_TTL_MS = 5 * 60 * 1000;
 const seenKey = (itemId, locId, available) => `${itemId}|${locId}|${available}`;
 function gcSeen(){ const now=Date.now(); for (const [k,ts] of seen) if (now-ts>SEEN_TTL_MS) seen.delete(k); }
 
-// ───────────────── endpoints básicos ─────────────────
+// ───────── routes básicas ─────────
 app.get('/health', (_req, res) => res.send('OK'));
 app.get('/env-check', (_req, res) => {
   res.json({
@@ -99,7 +113,7 @@ app.get('/env-check', (_req, res) => {
   });
 });
 
-// eco crudo para verificar llegada de POSTs (sin HMAC)
+// echo crudo (debug)
 app.post('/_echo_raw', express.raw({ type: '*/*' }), (req, res) => {
   const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
   console.log('ECHO RAW headers:', req.headers);
@@ -107,15 +121,13 @@ app.post('/_echo_raw', express.raw({ type: '*/*' }), (req, res) => {
   res.json({ ok: true, len: raw.length });
 });
 
-// ───────────────── lógica común ─────────────────
+// lógica común
 async function handleInventoryPayload(payload) {
   const itemId = payload.inventory_item_id;
   const locId  = payload.location_id;
   const avail  = Number(payload.available ?? 0);
 
-  if (!itemId || !locId) {
-    return { ok: true, ignored: 'faltan ids o body vacío' };
-  }
+  if (!itemId || !locId) return { ok: true, ignored: 'faltan ids o body vacío' };
 
   gcSeen();
   const key = seenKey(itemId, locId, avail);
@@ -135,15 +147,12 @@ async function handleInventoryPayload(payload) {
 
   const data = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
   const errs = data.inventorySetOnHandQuantities.userErrors || [];
-  if (errs.length) {
-    console.error('userErrors', errs);
-    return { ok: false, userErrors: errs };
-  }
+  if (errs.length) return { ok: false, userErrors: errs };
 
   return { ok: true, fixed: true, inventory_item_id: itemId, location_id: locId, set_on_hand_to: 0 };
 }
 
-// ───────────────── webhook real (RAW + HMAC + logs) ─────────────────
+// webhook real (RAW + HMAC)
 app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*' }), async (req, res) => {
   try {
     const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
@@ -161,7 +170,6 @@ app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*' }), asyn
     }
     console.log('✅ HMAC verificado.');
 
-    // tolerante a cuerpo vacío o "null"
     let payload = {};
     try {
       const txt = raw.toString('utf8').trim();
@@ -172,7 +180,6 @@ app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*' }), asyn
     }
 
     log('📦 Payload parseado:', payload);
-
     const result = await handleInventoryPayload(payload);
     log('🛠️  Resultado:', result);
 
@@ -183,7 +190,7 @@ app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*' }), asyn
   }
 });
 
-// ───────────────── test manual (sin HMAC) ─────────────────
+// test manual
 app.post('/_test/inventory_levels/update', express.json(), async (req, res) => {
   try {
     const result = await handleInventoryPayload(req.body || {});
