@@ -156,7 +156,7 @@ async function handleInventoryPayload(payload) {
   if (avail >= 0) return { ok: true, negative: false, available: avail };
 
   const input = {
-    reason: 'auto-fix-negative-available',
+    reason: 'correction',
     setQuantities: [{
       inventoryItemId: gid('InventoryItem', itemId),
       locationId:     gid('Location', locId),
