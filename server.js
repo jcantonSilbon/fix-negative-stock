@@ -8,8 +8,12 @@ const PORT = process.env.PORT || 8080;
 
 const SHOP  = process.env.SHOPIFY_SHOP;
 const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
-const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-04';
-const WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
+const API_VERSION = process.env.SHOPIFY_API_VERSION || '2024-04';
+
+// Lee el secreto correcto; soporta el typo por si quedó configurado así
+const RAW_SECRET =
+  (process.env.SHOPIFY_WEBHOOK_SECRET ?? process.env.SHOPIFY_WEBHOOK_SEGRET ?? '').trim();
+const WEBHOOK_SECRET = RAW_SECRET || null;
 
 if (!SHOP || !TOKEN || !WEBHOOK_SECRET) {
   console.warn('Faltan envs: SHOPIFY_SHOP / SHOPIFY_ADMIN_TOKEN / SHOPIFY_WEBHOOK_SECRET');
@@ -21,7 +25,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// --- añade arriba, tras el logger mínimo ---
+// Debug controlado por env
 const DEBUG = process.env.DEBUG_WEBHOOKS === '1';
 function log(...args){ if (DEBUG) console.log(...args); }
 
@@ -44,15 +48,24 @@ async function shopifyGraphQL(query, variables = {}) {
 }
 
 function verifyHmac(rawBody, req) {
-  const signature = req.get('X-Shopify-Hmac-Sha256') || '';
+  const signature = (req.get('X-Shopify-Hmac-Sha256') || '').trim();
   if (!signature || !WEBHOOK_SECRET) return false;
+
+  // Calcula HMAC con la clave EXACTA tal como la muestra Shopify (string ASCII), no base64-decoded.
   const digestB64 = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('base64');
-  console.log('digestB64:', digestB64);
-  console.log('match :', digestB64 === SIG);
+
+  // Compara buffers (base64 → bytes)
   const a = Buffer.from(digestB64, 'base64');
   const b = Buffer.from(signature,  'base64');
   if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+
+  const ok = crypto.timingSafeEqual(a, b);
+  if (DEBUG) {
+    console.log('➡️  HMAC digest (server, base64):', digestB64);
+    console.log('➡️  HMAC signature (shopify):    ', signature);
+    console.log('➡️  HMAC match?:', ok);
+  }
+  return ok;
 }
 
 // ───────────────── GQL mutation ─────────────────
@@ -130,19 +143,13 @@ async function handleInventoryPayload(payload) {
 app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*' }), async (req, res) => {
   try {
     const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
-    const sig  = req.get('X-Shopify-Hmac-Sha256') || '';
+
     const topic = req.get('X-Shopify-Topic');
     const shop  = req.get('X-Shopify-Shop-Domain');
-
-    let digestB64 = '';
-    if (WEBHOOK_SECRET) {
-      digestB64 = crypto.createHmac('sha256', WEBHOOK_SECRET).update(raw).digest('base64');
-    }
+    const sig   = req.get('X-Shopify-Hmac-Sha256') || '';
 
     log('➡️  Webhook headers:', { topic, shop, sigLen: sig.length, contentType: req.get('content-type') });
     log('➡️  Raw length:', raw.length);
-    log('➡️  HMAC digest (server, base64):', digestB64);
-    log('➡️  HMAC signature (shopify):    ', sig);
 
     if (!verifyHmac(raw, req)) {
       console.warn('❌ Bad HMAC (rechazado).');
@@ -150,6 +157,7 @@ app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*' }), asyn
     }
     console.log('✅ HMAC verificado.');
 
+    // tolerante a cuerpo vacío o "null"
     let payload = {};
     try {
       const txt = raw.toString('utf8').trim();
