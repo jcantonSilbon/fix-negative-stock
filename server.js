@@ -10,9 +10,8 @@ const SHOP  = process.env.SHOPIFY_SHOP;
 const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2024-04';
 
-// Lee el secreto correcto; soporta el typo por si quedó configurado así
-const RAW_SECRET =
-  (process.env.SHOPIFY_WEBHOOK_SECRET ?? process.env.SHOPIFY_WEBHOOK_SEGRET ?? '').trim();
+// lee el secreto (admite el typo SEGRET) y trímalo
+const RAW_SECRET = (process.env.SHOPIFY_WEBHOOK_SECRET ?? process.env.SHOPIFY_WEBHOOK_SEGRET ?? '').trim();
 const WEBHOOK_SECRET = RAW_SECRET || null;
 
 if (!SHOP || !TOKEN || !WEBHOOK_SECRET) {
@@ -25,9 +24,14 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Debug controlado por env
 const DEBUG = process.env.DEBUG_WEBHOOKS === '1';
 function log(...args){ if (DEBUG) console.log(...args); }
+
+// log de diagnóstico del secreto (solo si DEBUG=1)
+if (DEBUG) {
+  const prev = WEBHOOK_SECRET ? WEBHOOK_SECRET.slice(0, 6) + '...' + WEBHOOK_SECRET.slice(-4) : null;
+  console.log('🔐 Secret loaded?', !!WEBHOOK_SECRET, 'len=', WEBHOOK_SECRET?.length, 'preview=', prev);
+}
 
 // ───────────────── helpers ─────────────────
 function gid(type, id) {
@@ -51,10 +55,10 @@ function verifyHmac(rawBody, req) {
   const signature = (req.get('X-Shopify-Hmac-Sha256') || '').trim();
   if (!signature || !WEBHOOK_SECRET) return false;
 
-  // Calcula HMAC con la clave EXACTA tal como la muestra Shopify (string ASCII), no base64-decoded.
+  // HMAC SHA256 del cuerpo crudo con la clave EXACTA tal cual aparece en Shopify
   const digestB64 = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('base64');
 
-  // Compara buffers (base64 → bytes)
+  // compara como bytes
   const a = Buffer.from(digestB64, 'base64');
   const b = Buffer.from(signature,  'base64');
   if (a.length !== b.length) return false;
