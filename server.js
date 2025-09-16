@@ -92,17 +92,22 @@ async function handleInventoryPayload(payload) {
   const locId  = payload.location_id;
   const avail  = Number(payload.available ?? 0);
 
-  if (!itemId || !locId) return { ok: true, ignored: 'faltan ids o body vacío' };
+  if (!itemId || !locId) {
+    return { ok: true, ignored: 'faltan ids o body vacío' };
+  }
 
+  // dedupe por (item, loc, available)
   gcSeen();
   const key = seenKey(itemId, locId, avail);
   if (seen.has(key)) return { ok: true, deduped: true };
   seen.set(key, Date.now());
 
+  // si no es negativo, no tocamos nada
   if (avail >= 0) return { ok: true, negative: false, available: avail };
 
+  // NEGATIVO → fijar a 0
   const input = {
-    reason: 'correction', // razón válida
+    reason: 'correction',
     setQuantities: [{
       inventoryItemId: gid('InventoryItem', itemId),
       locationId:     gid('Location', locId),
@@ -113,12 +118,23 @@ async function handleInventoryPayload(payload) {
   const data = await shopifyGraphQL(INVENTORY_SET_ON_HAND, { input });
   const errs = data.inventorySetOnHandQuantities.userErrors || [];
   if (errs.length) {
-    console.error('inventorySetOnHandQuantities.userErrors', errs);
+    console.error('❌ FIX ERROR', { itemId, locId, before: avail, errs });
     return { ok: false, userErrors: errs };
   }
 
-  return { ok: true, fixed: true, inventory_item_id: itemId, location_id: locId, set_on_hand_to: 0 };
+  // 👇 log limpio y siempre visible cuando se corrige
+  console.log(`⚡ FIXED NEGATIVE → item ${itemId} @ loc ${locId}: ${avail} → 0`);
+
+  return {
+    ok: true,
+    fixed: true,
+    inventory_item_id: itemId,
+    location_id: locId,
+    before_available: avail,
+    set_on_hand_to: 0
+  };
 }
+
 
 // ───────── webhook (RAW + HMAC) ─────────
 app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
