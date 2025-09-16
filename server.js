@@ -6,20 +6,27 @@ import fetch from 'node-fetch';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-const SHOP         = process.env.SHOPIFY_SHOP;
-const TOKEN        = process.env.SHOPIFY_ADMIN_TOKEN;
-const API_VERSION  = process.env.SHOPIFY_API_VERSION || '2024-04';
-// soporta el typo SEGRET y trimea
-const RAW_SECRET   = (process.env.SHOPIFY_WEBHOOK_SECRET ?? process.env.SHOPIFY_WEBHOOK_SEGRET ?? '').trim();
+const SHOP        = process.env.SHOPIFY_SHOP;
+const TOKEN       = process.env.SHOPIFY_ADMIN_TOKEN;
+const API_VERSION = process.env.SHOPIFY_API_VERSION || '2024-04';
+
+// soporta el typo SEGRET y trim
+const RAW_SECRET     = (process.env.SHOPIFY_WEBHOOK_SECRET ?? process.env.SHOPIFY_WEBHOOK_SEGRET ?? '').trim();
 const WEBHOOK_SECRET = RAW_SECRET || null;
 
-// ---- sanity check envs (una sola línea) ----
-if (!SHOP || !TOKEN || !WEBHOOK_SECRET) console.warn('⚠️ Faltan envs: SHOPIFY_SHOP / SHOPIFY_ADMIN_TOKEN / SHOPIFY_WEBHOOK_SECRET');
+// DEBUG granular
+const DEBUG = process.env.DEBUG_WEBHOOKS === '1';
+const dlog = (...args) => { if (DEBUG) console.log(...args); };
+
+// ---- sanity check envs ----
+if (!SHOP || !TOKEN || !WEBHOOK_SECRET) {
+  console.warn('⚠️ Faltan envs: SHOPIFY_SHOP / SHOPIFY_ADMIN_TOKEN / SHOPIFY_WEBHOOK_SECRET');
+}
 
 // ---- logger mínimo (método + path) ----
-app.use((req, _res, next) => { 
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`); 
-  next(); 
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
 });
 
 // ───────── helpers ─────────
@@ -40,15 +47,13 @@ async function shopifyGraphQL(query, variables = {}) {
   return json.data;
 }
 
-// HMAC: si el secreto parece HEX, úsalo como hex; si no, como ascii tal cual
+// HMAC: si el secreto parece HEX, úsalo como hex; si no, ascii tal cual
 function verifyHmac(rawBody, signatureB64) {
   if (!WEBHOOK_SECRET || !signatureB64) return false;
-
   const key =
     /^[0-9a-fA-F]+$/.test(WEBHOOK_SECRET) && WEBHOOK_SECRET.length % 2 === 0
       ? Buffer.from(WEBHOOK_SECRET, 'hex')
       : WEBHOOK_SECRET; // ascii
-
   const calcB64 = crypto.createHmac('sha256', key).update(rawBody).digest('base64');
   const a = Buffer.from(calcB64, 'base64');
   const b = Buffer.from(signatureB64, 'base64');
@@ -70,9 +75,9 @@ const INVENTORY_SET_ON_HAND = `
 const seen = new Map();
 const SEEN_TTL_MS = 5 * 60 * 1000;
 const seenKey = (itemId, locId, available) => `${itemId}|${locId}|${available}`;
-function gcSeen() { 
-  const now = Date.now(); 
-  for (const [k, ts] of seen) if (now - ts > SEEN_TTL_MS) seen.delete(k); 
+function gcSeen() {
+  const now = Date.now();
+  for (const [k, ts] of seen) if (now - ts > SEEN_TTL_MS) seen.delete(k);
 }
 
 // ───────── health/env ─────────
@@ -93,24 +98,33 @@ async function handleInventoryPayload(payload) {
   const avail  = Number(payload.available ?? 0);
 
   if (!itemId || !locId) {
+    dlog('↪︎ ignored: faltan ids o body vacío');
     return { ok: true, ignored: 'faltan ids o body vacío' };
   }
 
   // dedupe por (item, loc, available)
   gcSeen();
   const key = seenKey(itemId, locId, avail);
-  if (seen.has(key)) return { ok: true, deduped: true };
+  if (seen.has(key)) {
+    dlog(`↪︎ dedup: item ${itemId} @ ${locId} avail=${avail}`);
+    return { ok: true, deduped: true };
+  }
   seen.set(key, Date.now());
 
+  dlog(`→ evento: item ${itemId} @ ${locId} avail=${avail}`);
+
   // si no es negativo, no tocamos nada
-  if (avail >= 0) return { ok: true, negative: false, available: avail };
+  if (avail >= 0) {
+    dlog('↪︎ skip: no negativo');
+    return { ok: true, negative: false, available: avail };
+  }
 
   // NEGATIVO → fijar a 0
   const input = {
     reason: 'correction',
     setQuantities: [{
       inventoryItemId: gid('InventoryItem', itemId),
-      locationId:     gid('Location', locId),
+      locationId:     gid('Location',  locId),
       quantity: 0
     }]
   };
@@ -122,7 +136,7 @@ async function handleInventoryPayload(payload) {
     return { ok: false, userErrors: errs };
   }
 
-  // 👇 log limpio y siempre visible cuando se corrige
+  // log siempre visible en corrección
   console.log(`⚡ FIXED NEGATIVE → item ${itemId} @ loc ${locId}: ${avail} → 0`);
 
   return {
@@ -135,7 +149,6 @@ async function handleInventoryPayload(payload) {
   };
 }
 
-
 // ───────── webhook (RAW + HMAC) ─────────
 app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*', limit: '2mb' }), async (req, res) => {
   try {
@@ -143,7 +156,7 @@ app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*', limit: 
     const sig = (req.get('X-Shopify-Hmac-Sha256') || '').trim();
 
     if (!verifyHmac(raw, sig)) {
-      // 401 para que Shopify reintente solo si realmente falla nuestra verificación
+      console.warn('❌ Bad HMAC (rechazado)');
       return res.status(401).send('Bad HMAC');
     }
 
