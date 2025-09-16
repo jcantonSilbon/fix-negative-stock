@@ -21,7 +21,9 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ⛔️ NO hay express.json() global
+// --- añade arriba, tras el logger mínimo ---
+const DEBUG = process.env.DEBUG_WEBHOOKS === '1';
+function log(...args){ if (DEBUG) console.log(...args); }
 
 // ───────────────── helpers ─────────────────
 function gid(type, id) {
@@ -45,7 +47,6 @@ function verifyHmac(rawBody, req) {
   const signature = req.get('X-Shopify-Hmac-Sha256') || '';
   if (!signature || !WEBHOOK_SECRET) return false;
   const digestB64 = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('base64');
-  // comparar como buffers BASE64 (no utf8)
   const a = Buffer.from(digestB64, 'base64');
   const b = Buffer.from(signature,  'base64');
   if (a.length !== b.length) return false;
@@ -123,20 +124,44 @@ async function handleInventoryPayload(payload) {
   return { ok: true, fixed: true, inventory_item_id: itemId, location_id: locId, set_on_hand_to: 0 };
 }
 
-// ───────────────── webhook real (RAW + HMAC) ─────────────────
+// ───────────────── webhook real (RAW + HMAC + logs) ─────────────────
 app.post('/webhooks/inventory_levels/update', express.raw({ type: '*/*' }), async (req, res) => {
   try {
     const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
-    if (!verifyHmac(raw, req)) return res.status(401).send('Bad HMAC');
+    const sig  = req.get('X-Shopify-Hmac-Sha256') || '';
+    const topic = req.get('X-Shopify-Topic');
+    const shop  = req.get('X-Shopify-Shop-Domain');
 
-    // tolerante a cuerpo "null" o vacío
+    let digestB64 = '';
+    if (WEBHOOK_SECRET) {
+      digestB64 = crypto.createHmac('sha256', WEBHOOK_SECRET).update(raw).digest('base64');
+    }
+
+    log('➡️  Webhook headers:', { topic, shop, sigLen: sig.length, contentType: req.get('content-type') });
+    log('➡️  Raw length:', raw.length);
+    log('➡️  HMAC digest (server, base64):', digestB64);
+    log('➡️  HMAC signature (shopify):    ', sig);
+
+    if (!verifyHmac(raw, req)) {
+      console.warn('❌ Bad HMAC (rechazado).');
+      return res.status(401).send('Bad HMAC');
+    }
+    console.log('✅ HMAC verificado.');
+
     let payload = {};
     try {
       const txt = raw.toString('utf8').trim();
       payload = txt ? (JSON.parse(txt) ?? {}) : {};
-    } catch { payload = {}; }
+    } catch (e) {
+      console.warn('⚠️  JSON parse error, usando {}:', e.message);
+      payload = {};
+    }
+
+    log('📦 Payload parseado:', payload);
 
     const result = await handleInventoryPayload(payload);
+    log('🛠️  Resultado:', result);
+
     res.status(200).json(result);
   } catch (e) {
     console.error('webhook error', e);
